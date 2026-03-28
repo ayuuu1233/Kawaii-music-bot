@@ -10,6 +10,7 @@ API_ID = 21621475
 API_HASH = "50c4947b6fe96901599c8b18b09f3e13"
 BOT_TOKEN = "7924287783:AAF8fh-HJp1nNgecaz9pf9K-gG514aA5_b0"
 SESSION = "BQFJ6uMAwP9Eovt9pF_qPWVfSR3o8DPppNraZWSledX0QJMxDSKc8qPur7Ewj9HtQZc0xsIYm1m04jhohAJEUrCsG0EkDBQDrUCxTCNmxZr13BnyiN7jIZRRkyQiG_ggt4tgOgxS6RQAGAHW4jhDI9kNE3xkbylK4aSBQ_43Jh2ynZS18RPf3LEBDjm-gCiFx8GaqvxrEZlIpY7Zz6RJSgoMmX9YNE4y0fWN5Z3C8OLubFVFI2j74hjvFy2pVAo3o-TJBsv30Cbt4eAlIXqDxijdyNCU7xUUy1ne3fYOIRxHHSKtVGZSFyJyuyPBQprutfR1BzIyx5qVT1ZM_G9UteD43Zh5jwAAAAEzcQmrAA"
+
 app = Client("musicbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 # ✅ ADD HERE
 assistant = Client(
@@ -189,6 +190,7 @@ async def buttons(_, query):
 
 # 🚀 START
 assistant.start()
-app.start()                                                                                                                                                                         call.start()
+app.start()
+call.start()
 print("🔥 GOD MUSIC BOT RUNNING 🔥")
 asyncio.get_event_loop().run_forever()
