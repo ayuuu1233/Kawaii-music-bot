@@ -16,10 +16,10 @@ SESSION = "BQFJ6uMAwP9Eovt9pF_qPWVfSR3o8DPppNraZWSledX0QJMxDSKc8qPur7Ewj9HtQZc0x
 app = Client("musicbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 # ✅ ADD HERE
 assistant = Client(
-    "assistant",
+    SESSION,  
     api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION
+    api_hash=API_HASH
+
 )
 
 # ✅ CHANGE HERE
