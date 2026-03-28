@@ -1,6 +1,4 @@
-pyrogram==1.4.16
-tgcrypto==1.2.5
+pyrogram==2.0.106
+TgCrypto
+PyTgCalls>=1.0.0
 yt-dlp
-py-tgcalls==2.2.8
-ntgcalls==2.0.9
-ffmpeg-python
