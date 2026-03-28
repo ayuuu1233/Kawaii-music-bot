@@ -1,10 +1,11 @@
 import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioPiped
 from pytgcalls.types import StreamAudioEnded
-import yt_dlp
+
+import yt_dlp 
 
 
 API_ID = 21621475
@@ -55,20 +56,16 @@ async def start_stream(chat_id: int):
 
     url, title = QUEUE[chat_id][0]
 
-    # New AudioPiped import
-    from pytgcalls import AudioPiped
-
-    # Join the VC and start streaming
-    await call.join_group_call(
+    # ⚠️ NEW METHOD: direct stream
+    await call.play(
         chat_id,
-        AudioPiped(url),
-        stream_type="local_stream"  # new API requires stream_type
+        url
     )
 
     print(f"Now playing: {title} 🎶")
 
 
- # 💖 START COMMAND
+# 💖 START COMMAND
 @app.on_message(filters.command("start"))
 async def start(_, message):
     msg = await message.reply_text("💖 Starting... UwU")
