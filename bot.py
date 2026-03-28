@@ -2,8 +2,8 @@ import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioPiped
-from pytgcalls.types.stream import StreamAudioEnded
+from pytgcalls.types import AudioPiped
+from pytgcalls.types import StreamAudioEnded
 import yt_dlp
 
 API_ID = 21621475
@@ -56,7 +56,7 @@ async def start_stream(chat_id):
 
     await call.join_group_call(
         chat_id,
-        AudioPiped(url)
+        AudioPiped("song.mp3")
     )
 
 
@@ -110,7 +110,8 @@ async def play(_, message):
 
 # ⏭ AUTO NEXT
 @call.on_stream_end()
-async def stream_end_handler(_, update: StreamAudioEnded):
+async def on_end(_, update: StreamAudioEnded):
+    print("song ended bro 💀") 
     chat_id = update.chat_id
 
     if chat_id in QUEUE:
