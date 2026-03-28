@@ -179,9 +179,14 @@ async def buttons(_, query):
 
     elif query.data == "skip":
         if chat_id in QUEUE and len(QUEUE[chat_id]) > 1:
-            QUEUE[chat_id].pop(0) 
-          await start_stream(chat_id)
-          await query.answer("Stopped")
+            QUEUE[chat_id].pop(0)
+            await start_stream(chat_id)
+            await query.answer("Skipped")
+
+    elif query.data == "stop":
+        QUEUE[chat_id] = []
+        await call.leave_group_call(chat_id)
+        await query.answer("Stopped")
 
 # 🚀 START
 assistant.start()
