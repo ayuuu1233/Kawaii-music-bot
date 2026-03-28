@@ -1,41 +1,28 @@
 import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
 from pytgcalls import PyTgCalls
+from pyrogram import idle
+import yt_dlp
 
-
-import yt_dlp 
-
-
+# 🔐 CONFIG
 API_ID = 21621475
 API_HASH = "50c4947b6fe96901599c8b18b09f3e13"
 BOT_TOKEN = "7924287783:AAF8fh-HJp1nNgecaz9pf9K-gG514aA5_b0"
 SESSION = "BQFJ6uMAwP9Eovt9pF_qPWVfSR3o8DPppNraZWSledX0QJMxDSKc8qPur7Ewj9HtQZc0xsIYm1m04jhohAJEUrCsG0EkDBQDrUCxTCNmxZr13BnyiN7jIZRRkyQiG_ggt4tgOgxS6RQAGAHW4jhDI9kNE3xkbylK4aSBQ_43Jh2ynZS18RPf3LEBDjm-gCiFx8GaqvxrEZlIpY7Zz6RJSgoMmX9YNE4y0fWN5Z3C8OLubFVFI2j74hjvFy2pVAo3o-TJBsv30Cbt4eAlIXqDxijdyNCU7xUUy1ne3fYOIRxHHSKtVGZSFyJyuyPBQprutfR1BzIyx5qVT1ZM_G9UteD43Zh5jwAAAAEzcQmrAA"
 
+# 🤖 Clients
 app = Client("musicbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-# ✅ ADD HERE
+
 assistant = Client(
-    SESSION,  
+    SESSION,
     api_id=API_ID,
     api_hash=API_HASH
-
 )
 
-# ✅ CHANGE HERE
 call = PyTgCalls(assistant)
 
-# 🎀 Typing animation
-async def typing_effect(message, text):
-    for i in range(1, len(text) + 1):
-        try:
-            await message.edit_text(text[:i])
-        except:
-            pass
-        await asyncio.sleep(0.04)
-
-
-# 🎧 Queue system
+# 🎧 Queue
 QUEUE = {}
 
 # 🔍 YouTube Search
@@ -56,35 +43,11 @@ async def start_stream(chat_id: int):
 
     url, title = QUEUE[chat_id][0]
 
-    # ⚠️ NEW METHOD: direct stream
-    await call.play(
-        chat_id,
-        url
-    )
-
-    print(f"Now playing: {title} 🎶")
-
-
-# 💖 START COMMAND
-@app.on_message(filters.command("start"))
-async def start(_, message):
-    msg = await message.reply_text("💖 Starting... UwU")
-
-    await typing_effect(
-        msg,
-        "✨ Loading Kawaii Music System... 🎶\n🌸 Preparing everything for you Senpai~ 💕"
-    )
-
-    await message.reply_video(
-        video="https://files.catbox.moe/9w0qsn.mp4",
-        caption=(
-            "💖 *Kawaii Music Bot Activated!* 🎶\n\n"
-            f"🌸 Hello {message.from_user.first_name} Senpai~ UwU 💕\n"
-            "🎧 I am your cute music assistant!\n\n"
-            "👉 Use: /play <song name>\n"
-            "💡 Example: /play Faded"
-        )
-    )
+    try:
+        await call.play(chat_id, url)
+        print(f"Playing: {title}")
+    except Exception as e:
+        print("Error:", e)
 
 # ▶️ PLAY
 @app.on_message(filters.command("play") & filters.group)
@@ -102,13 +65,7 @@ async def play(_, message):
 
     QUEUE[chat_id].append((url, title))
 
-    buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏯ Pause", callback_data="pause"),
-         InlineKeyboardButton("⏭ Skip", callback_data="skip")],
-        [InlineKeyboardButton("⏹ Stop", callback_data="stop")]
-    ])
-
-    await message.reply(f"🎧 Added: **{title}**", reply_markup=buttons)
+    await message.reply(f"🎧 Added: **{title}**")
 
     if len(QUEUE[chat_id]) == 1:
         await start_stream(chat_id)
@@ -117,16 +74,14 @@ async def play(_, message):
 @call.on_stream_end()
 async def on_end(_, update):
     chat_id = update.chat_id
-    print(f"Song ended in chat {chat_id} 🔥")
 
     if chat_id in QUEUE:
-        QUEUE[chat_id].pop(0)  # Remove finished song
+        QUEUE[chat_id].pop(0)
 
         if QUEUE[chat_id]:
-            await start_stream(chat_id)  # Play next song
+            await start_stream(chat_id)
         else:
-            await call.leave_group_call(chat_id)  # Leave VC
-            print(f"Left VC in chat {chat_id} 🎵")
+            await call.leave_group_call(chat_id)
 
 # ⏭ SKIP
 @app.on_message(filters.command("skip") & filters.group)
@@ -136,9 +91,9 @@ async def skip(_, message):
     if chat_id in QUEUE and len(QUEUE[chat_id]) > 1:
         QUEUE[chat_id].pop(0)
         await start_stream(chat_id)
-        await message.reply("⏭ Skipped!")
+        await message.reply("⏭ Skipped")
     else:
-        await message.reply("❌ No more songs")
+        await message.reply("❌ No songs")
 
 # ⏹ STOP
 @app.on_message(filters.command("stop") & filters.group)
@@ -147,7 +102,7 @@ async def stop(_, message):
 
     QUEUE[chat_id] = []
     await call.leave_group_call(chat_id)
-    await message.reply("⛔ Stopped!")
+    await message.reply("⛔ Stopped")
 
 # ⏸ PAUSE
 @app.on_message(filters.command("pause") & filters.group)
@@ -169,35 +124,20 @@ async def queue(_, message):
     if chat_id not in QUEUE or not QUEUE[chat_id]:
         return await message.reply("❌ Empty queue")
 
-    text = "🎶 **Queue:**\n\n"
+    text = "🎶 Queue:\n\n"
     for i, (_, title) in enumerate(QUEUE[chat_id], start=1):
         text += f"{i}. {title}\n"
 
     await message.reply(text)
 
-# 🔘 BUTTON HANDLER
-@app.on_callback_query()
-async def buttons(_, query):
-    chat_id = query.message.chat.id
+# 🚀 START BOT
+async def main():
+    await assistant.start()
+    await app.start()
+    await call.start()
 
-    if query.data == "pause":
-        await call.pause_stream(chat_id)
-        await query.answer("Paused")
+    print("🔥 MUSIC BOT RUNNING 🔥")
 
-    elif query.data == "skip":
-        if chat_id in QUEUE and len(QUEUE[chat_id]) > 1:
-            QUEUE[chat_id].pop(0)
-            await start_stream(chat_id)
-            await query.answer("Skipped")
+    await idle()
 
-    elif query.data == "stop":
-        QUEUE[chat_id] = []
-        await call.leave_group_call(chat_id)
-        await query.answer("Stopped")
-
-# 🚀 START
-assistant.start()
-app.start()
-call.start()
-print("🔥 GOD MUSIC BOT RUNNING 🔥")
-asyncio.get_event_loop().run_forever()
+asyncio.run(main())
