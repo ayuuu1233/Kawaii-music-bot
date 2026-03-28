@@ -2,8 +2,8 @@ import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pytgcalls import PyTgCalls
-from pytgcalls import AudioPiped
-from pytgcalls import StreamAudioEnded
+from pytgcalls.types import AudioPiped
+from pytgcalls.types import StreamAudioEnded
 import yt_dlp
 
 
