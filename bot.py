@@ -2,8 +2,8 @@ import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioPiped
-from pytgcalls.types.stream import StreamAudioEnded
+from pytgcalls import AudioPiped
+from pytgcalls import StreamAudioEnded
 import yt_dlp
 
 
@@ -49,16 +49,23 @@ def yt_search(query):
         return info["url"], info["title"]
 
 # 🎵 Start Stream
-async def start_stream(chat_id):
+async def start_stream(chat_id: int):
     if chat_id not in QUEUE or not QUEUE[chat_id]:
         return
 
     url, title = QUEUE[chat_id][0]
 
+    # New AudioPiped import
+    from pytgcalls import AudioPiped
+
+    # Join the VC and start streaming
     await call.join_group_call(
         chat_id,
-        AudioPiped(url)
+        AudioPiped(url),
+        stream_type="local_stream"  # new API requires stream_type
     )
+
+    print(f"Now playing: {title} 🎶")
 
 
  # 💖 START COMMAND
@@ -111,17 +118,18 @@ async def play(_, message):
 
 # ⏭ AUTO NEXT
 @call.on_stream_end()
-async def stream_end_handler(_, update: StreamAudioEnded):
-    print("song ended bro 💀") 
+async def on_end(_, update):
     chat_id = update.chat_id
+    print(f"Song ended in chat {chat_id} 🔥")
 
     if chat_id in QUEUE:
-        QUEUE[chat_id].pop(0)
+        QUEUE[chat_id].pop(0)  # Remove finished song
 
         if QUEUE[chat_id]:
-            await start_stream(chat_id)
+            await start_stream(chat_id)  # Play next song
         else:
-            await call.leave_group_call(chat_id)
+            await call.leave_group_call(chat_id)  # Leave VC
+            print(f"Left VC in chat {chat_id} 🎵")
 
 # ⏭ SKIP
 @app.on_message(filters.command("skip") & filters.group)
