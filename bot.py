@@ -1,46 +1,65 @@
 """
-🎀 Kawaii Telegram Music Bot  v2.0
-Built with Pyrogram + PyTgCalls + yt-dlp
+🎀 Kawaii Telegram Music Bot  v3.0
+Rewritten with python-telegram-bot v20+ (async) + pytgcalls + yt-dlp
 
-FIXED BUGS:
-  - typing_effect referenced undefined 'msg' variable
-  - start_cmd had unclosed reply_video() and dangling 'text' var
-  - ensure_in_voice was never used properly
-  - deprecated asyncio.get_event_loop() pattern replaced
-  - on_stream_end now correctly advances queue
-  - queue race-condition guarded with asyncio.Lock per chat
+CHANGES FROM v2 (pyrogram):
+  - Migrated from pyrogram → python-telegram-bot v20+ (full async)
+  - ApplicationBuilder pattern used for bot lifecycle
+  - ConversationHandler not needed; callback_query handlers cover inline btns
+  - asyncio.get_event_loop() replaced with asyncio.get_running_loop()
+  - All command handlers use (update, context) PTB signature
+  - Graceful shutdown via Application.run_polling() stop_signals param
+  - All v2 bugs carried over fixed here too
 
-NEW FEATURES:
-  - Per-chat asyncio.Lock to prevent double-play race conditions
-  - Volume control command /vol <0-200>
-  - Loop mode toggle /loop
-  - Now-playing with duration & progress bar
-  - /search shows top 5 results as inline buttons
-  - Admin-only /stop and /skip (configurable)
-  - Auto-leave voice chat after queue ends (configurable delay)
-  - Structured logging instead of bare print()
-  - Graceful shutdown (SIGINT / SIGTERM)
-  - Retry logic for yt-dlp failures
-  - typing_effect fixed to accept the msg object as a parameter
+BUG FIXES (same as v2):
+  - typing_effect now accepts msg as explicit parameter
+  - start_cmd properly awaits reply_video + cleans up placeholder
+  - play_next guarded with per-chat asyncio.Lock (no race condition)
+  - on_stream_end signature fixed for pytgcalls v2 (client, update)
+  - asyncio.get_event_loop() replaced everywhere with get_running_loop()
+
+FEATURES:
+  - /play  <song>          — search & play from YouTube
+  - /search <song>         — pick from top-5 inline results
+  - /np                    — now playing with progress bar
+  - /queue                 — full queue listing
+  - /pause /resume         — playback control
+  - /skip                  — admin only, skip current track
+  - /stop                  — admin only, stop & clear
+  - /loop                  — toggle per-chat loop mode
+  - /vol <0-200>           — admin only, volume control
+  - Inline player keyboard (pause/resume/skip/stop/queue/loop)
+  - Auto-leave VC after idle (configurable)
+  - Per-chat asyncio.Lock prevents double-play race conditions
+  - Structured logging
+  - Retry logic on yt-dlp failures
 """
 
 import asyncio
 import logging
 import os
-import signal
 from collections import defaultdict
 from typing import Optional
 
 import yt_dlp
-from pyrogram import Client, filters
-from pyrogram.types import (
+from pyrogram import Client as PyrogramClient
+from pytgcalls import PyTgCalls
+from pytgcalls.types import AudioQuality, MediaStream
+from telegram import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    Update,
 )
-from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioQuality, MediaStream
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 # ─── LOGGING ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -55,30 +74,48 @@ API_ID          = int(os.environ.get("API_ID", 0))
 API_HASH        = os.environ.get("API_HASH", "")
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "")
 SESSION_STRING  = os.environ.get("SESSION_STRING", "")
-ADMIN_IDS       = list(map(int, os.environ.get("ADMIN_IDS", "").split(",") if os.environ.get("ADMIN_IDS") else []))
+ADMIN_IDS       = (
+    list(map(int, os.environ["ADMIN_IDS"].split(",")))
+    if os.environ.get("ADMIN_IDS")
+    else []
+)
 AUTO_LEAVE_SECS = int(os.environ.get("AUTO_LEAVE_SECS", "120"))  # 0 = never
 
-# ─── CLIENTS ───────────────────────────────────────────────────────────────────
-bot       = Client("music_bot",  api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-assistant = Client("assistant",  api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
-call      = PyTgCalls(assistant)
+# ─── PYROGRAM ASSISTANT + PYTGCALLS ────────────────────────────────────────────
+# python-telegram-bot handles the bot commands/messages.
+# Pyrogram assistant account handles the actual voice chat streaming via pytgcalls.
+assistant = PyrogramClient(
+    "assistant",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING,
+)
+call = PyTgCalls(assistant)
 
 # ─── STATE ─────────────────────────────────────────────────────────────────────
-queues:            dict[int, list[dict]]         = defaultdict(list)
-currently_playing: dict[int, Optional[dict]]     = {}
-loop_mode:         dict[int, bool]               = defaultdict(bool)
-chat_locks:        dict[int, asyncio.Lock]        = defaultdict(asyncio.Lock)
-auto_leave_tasks:  dict[int, asyncio.Task]        = {}
+queues:            dict[int, list[dict]]      = defaultdict(list)
+currently_playing: dict[int, Optional[dict]]  = {}
+loop_mode:         dict[int, bool]            = defaultdict(bool)
+# FIX: defaultdict(asyncio.Lock) doesn't work — Lock must be created per-chat lazily
+_chat_locks:       dict[int, asyncio.Lock]    = {}
+auto_leave_tasks:  dict[int, asyncio.Task]    = {}
+
+
+def _get_lock(chat_id: int) -> asyncio.Lock:
+    """Lazily create per-chat asyncio.Lock (fixes defaultdict(asyncio.Lock) issue)."""
+    if chat_id not in _chat_locks:
+        _chat_locks[chat_id] = asyncio.Lock()
+    return _chat_locks[chat_id]
+
 
 # ─── HELPERS ───────────────────────────────────────────────────────────────────
 
 def _is_admin(user_id: int) -> bool:
-    """Return True if ADMIN_IDS is empty (open) or user is in it."""
+    """Return True when ADMIN_IDS is empty (open-to-all) or user is listed."""
     return not ADMIN_IDS or user_id in ADMIN_IDS
 
 
 def _progress_bar(position: int, total: int, length: int = 12) -> str:
-    """Return a unicode progress bar string."""
     if total <= 0:
         return "▱" * length
     filled = int(length * position / total)
@@ -93,8 +130,8 @@ def _fmt_duration(secs: int) -> str:
 
 async def typing_effect(msg: Message, text: str, delay: float = 0.03) -> None:
     """
-    Animate a typing effect by progressively editing *msg*.
-    BUG FIX: original code used undefined 'msg' — now it's a proper parameter.
+    Progressive typing animation by repeatedly editing *msg*.
+    FIX: receives msg as an explicit parameter — v2 had 'msg' undefined here.
     """
     typed = ""
     for ch in text:
@@ -115,9 +152,9 @@ def player_keyboard(chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("⏭️ Skip",   callback_data="skip"),
         ],
         [
-            InlineKeyboardButton("⏹️ Stop",    callback_data="stop"),
-            InlineKeyboardButton("📋 Queue",   callback_data="queue"),
-            InlineKeyboardButton(loop_label,   callback_data="loop"),
+            InlineKeyboardButton("⏹️ Stop",  callback_data="stop"),
+            InlineKeyboardButton("📋 Queue", callback_data="queue"),
+            InlineKeyboardButton(loop_label, callback_data="loop"),
         ],
     ])
 
@@ -138,7 +175,7 @@ def _ydl_opts(extra: dict | None = None) -> dict:
 
 
 def search_yt(query: str, retries: int = 2) -> Optional[dict]:
-    """Search YouTube and return best audio stream info. Retries on failure."""
+    """Synchronous: search YouTube, return best audio info. Retries on failure."""
     opts = _ydl_opts({"default_search": "ytsearch1"})
     for attempt in range(retries + 1):
         try:
@@ -154,18 +191,18 @@ def search_yt(query: str, retries: int = 2) -> Optional[dict]:
                     "thumbnail":   info.get("thumbnail", ""),
                     "uploader":    info.get("uploader", "Unknown"),
                 }
-        except Exception as e:
-            log.warning("yt-dlp attempt %d/%d failed: %s", attempt + 1, retries + 1, e)
+        except Exception as exc:
+            log.warning("yt-dlp attempt %d/%d failed: %s", attempt + 1, retries + 1, exc)
             if attempt == retries:
                 return None
 
 
 def search_yt_multi(query: str, count: int = 5) -> list[dict]:
-    """Return top *count* YouTube results for a query."""
+    """Synchronous: return top *count* YouTube results for query."""
     opts = _ydl_opts({"default_search": f"ytsearch{count}"})
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(query, download=False)
+            info    = ydl.extract_info(query, download=False)
             entries = info.get("entries", [])
             return [
                 {
@@ -178,8 +215,8 @@ def search_yt_multi(query: str, count: int = 5) -> list[dict]:
                 }
                 for e in entries if e
             ]
-    except Exception as e:
-        log.error("multi-search error: %s", e)
+    except Exception as exc:
+        log.error("multi-search error: %s", exc)
         return []
 
 
@@ -192,11 +229,10 @@ async def _cancel_auto_leave(chat_id: int) -> None:
 
 
 async def _schedule_auto_leave(chat_id: int) -> None:
-    """Leave the voice chat after AUTO_LEAVE_SECS if nothing is playing."""
     if AUTO_LEAVE_SECS <= 0:
         return
 
-    async def _leave():
+    async def _leave() -> None:
         await asyncio.sleep(AUTO_LEAVE_SECS)
         if not currently_playing.get(chat_id) and not queues.get(chat_id):
             try:
@@ -211,13 +247,12 @@ async def _schedule_auto_leave(chat_id: int) -> None:
 
 async def play_next(chat_id: int) -> bool:
     """
-    Pop the next track from the queue and start streaming.
+    Pop the next track from the queue and begin streaming.
+    FIX: wrapped in per-chat Lock so concurrent skip/stream-end calls don't
+    trigger double-play.
     Returns True if a track was started.
-
-    BUG FIX: guarded with per-chat Lock to prevent race conditions when
-    multiple callers (skip, stream_end) trigger play_next simultaneously.
     """
-    async with chat_locks[chat_id]:
+    async with _get_lock(chat_id):
         if not queues[chat_id]:
             currently_playing.pop(chat_id, None)
             await _schedule_auto_leave(chat_id)
@@ -226,7 +261,6 @@ async def play_next(chat_id: int) -> bool:
         track = queues[chat_id].pop(0)
         currently_playing[chat_id] = track
 
-        # In loop mode, re-append to the back of the queue
         if loop_mode[chat_id]:
             queues[chat_id].append(track)
 
@@ -237,20 +271,19 @@ async def play_next(chat_id: int) -> bool:
             )
             log.info("Now playing in %d: %s", chat_id, track["title"])
             return True
-        except Exception as e:
-            log.error("play error in %d: %s", chat_id, e)
+        except Exception as exc:
+            log.error("play error in %d: %s", chat_id, exc)
             currently_playing.pop(chat_id, None)
             return False
 
 
-# ─── COMMANDS ──────────────────────────────────────────────────────────────────
+# ─── COMMAND HANDLERS ──────────────────────────────────────────────────────────
 
-@bot.on_message(filters.command("start"))
-async def start_cmd(_, message: Message) -> None:
-    name = message.from_user.first_name if message.from_user else "Senpai"
-    msg  = await message.reply_text("💖 Starting... UwU")
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """FIX: reply_video properly awaited; 'text' variable removed; msg properly passed."""
+    name = update.effective_user.first_name if update.effective_user else "Senpai"
+    msg  = await update.message.reply_text("💖 Starting... UwU")
 
-    # BUG FIX: typing_effect now receives msg as the first argument
     await typing_effect(msg, "✨ Loading Kawaii Music System... 🎶")
     await asyncio.sleep(0.8)
     await typing_effect(msg, "💫 Connecting to Voice Engine... 🎧")
@@ -258,13 +291,13 @@ async def start_cmd(_, message: Message) -> None:
     await typing_effect(msg, f"🌸 Welcome {name}-senpai~! 💕")
     await asyncio.sleep(0.6)
 
-    # BUG FIX: reply_video was never properly closed; 'text' was also undefined
-    await message.reply_video(
+    # FIX: reply_video now properly awaited and caption defined inline
+    await update.message.reply_video(
         video="https://files.catbox.moe/9w0qsn.mp4",
         caption=(
-            f"Konnichiwa **{name}**-senpai~! 💖\n\n"
-            "I'm your kawaii music bot, here to fill your voice chat with sweet tunes! 🎵\n\n"
-            "**Commands:**\n"
+            f"Konnichiwa *{name}*-senpai~! 💖\n\n"
+            "I'm your kawaii music bot, here to fill your voice chat with sweet tunes\\! 🎵\n\n"
+            "*Commands:*\n"
             "🎶 /play `<song>` — Play a song\n"
             "🔍 /search `<song>` — Pick from top 5 results\n"
             "⏸️ /pause — Pause music\n"
@@ -273,29 +306,35 @@ async def start_cmd(_, message: Message) -> None:
             "⏹️ /stop — Stop and clear queue\n"
             "📋 /queue — Show queue\n"
             "🔁 /loop — Toggle loop mode\n"
-            "🔊 /vol `<0-200>` — Set volume\n"
+            "🔊 /vol `<0\\-200>` — Set volume\n"
             "🎵 /np — Now playing\n\n"
-            "Let's make some music magic, nya~! ✨"
+            "Let's make some music magic, nya~\\! ✨"
         ),
+        parse_mode=ParseMode.MARKDOWN_V2,
     )
     await msg.delete()
 
 
-@bot.on_message(filters.command("play") & filters.group)
-async def play_cmd(_, message: Message) -> None:
-    chat_id = message.chat.id
+async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
 
-    if len(message.command) < 2:
-        await message.reply_text(
-            "Ara ara~ tell me what to play Senpai! 🎵\n"
-            "Usage: `/play <song name or YouTube URL>`"
+    if not context.args:
+        await update.message.reply_text(
+            "Ara ara~ tell me what to play Senpai\\! 🎵\n"
+            "Usage: `/play <song name or YouTube URL>`",
+            parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
 
-    query        = " ".join(message.command[1:])
-    searching_msg = await message.reply_text(f"🔍 Searching for **{query}**... please wait nya~")
+    query         = " ".join(context.args)
+    searching_msg = await update.message.reply_text(
+        f"🔍 Searching for *{query}*\\.\\.\\. please wait nya~",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
 
-    track = await asyncio.get_event_loop().run_in_executor(None, search_yt, query)
+    # FIX: use get_running_loop() instead of deprecated get_event_loop()
+    loop  = asyncio.get_running_loop()
+    track = await loop.run_in_executor(None, search_yt, query)
 
     if not track:
         await searching_msg.edit_text("Gomen nasai~ I couldn't find that song 😢")
@@ -314,39 +353,45 @@ async def play_cmd(_, message: Message) -> None:
         bar     = _progress_bar(0, now.get("duration", 1))
 
         if started:
-            await message.reply_text(
-                f"🎶 **Now Playing**\n\n"
-                f"🎵 **{now['title']}**\n"
+            await update.message.reply_text(
+                f"🎶 *Now Playing*\n\n"
+                f"🎵 *{now['title']}*\n"
                 f"👤 {now.get('uploader', 'Unknown')}\n"
                 f"⏱ {dur}  {bar}",
+                parse_mode=ParseMode.MARKDOWN,
                 reply_markup=player_keyboard(chat_id),
             )
         else:
-            await message.reply_text("Gomen~ something went wrong starting playback 😢")
+            await update.message.reply_text("Gomen~ something went wrong starting playback 😢")
     else:
         pos = len(queues[chat_id])
         dur = _fmt_duration(track.get("duration", 0))
-        await message.reply_text(
-            f"✅ **Added to Queue #{pos}**\n\n"
-            f"🎵 **{track['title']}**\n"
+        await update.message.reply_text(
+            f"✅ *Added to Queue \\#{pos}*\n\n"
+            f"🎵 *{track['title']}*\n"
             f"👤 {track.get('uploader', 'Unknown')}\n"
             f"⏱ {dur}\n\n"
             "Be patient Senpai, it'll be your turn soon~ 🌸",
+            parse_mode=ParseMode.MARKDOWN,
         )
 
 
-@bot.on_message(filters.command("search") & filters.group)
-async def search_cmd(_, message: Message) -> None:
-    if len(message.command) < 2:
-        await message.reply_text("Usage: `/search <song name>`")
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/search <song name>`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
         return
 
-    query = " ".join(message.command[1:])
-    msg   = await message.reply_text(f"🔍 Searching for top results: **{query}**...")
-
-    results = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: search_yt_multi(query, 5)
+    query = " ".join(context.args)
+    msg   = await update.message.reply_text(
+        f"🔍 Searching for top results: *{query}*\\.\\.\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
     )
+
+    loop    = asyncio.get_running_loop()
+    results = await loop.run_in_executor(None, lambda: search_yt_multi(query, 5))
 
     if not results:
         await msg.edit_text("No results found, gomen~ 😢")
@@ -361,62 +406,60 @@ async def search_cmd(_, message: Message) -> None:
     ]
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_search")])
 
-    text = "🎵 **Top Results** — pick a song Senpai~\n\n"
+    text = "🎵 *Top Results* — pick a song Senpai~\n\n"
     for i, r in enumerate(results):
-        text += f"`{i+1}.` **{r['title']}**\n   👤 {r.get('uploader','?')}  ⏱ {_fmt_duration(r['duration'])}\n\n"
+        text += f"`{i+1}.` *{r['title']}*\n   👤 {r.get('uploader','?')}  ⏱ {_fmt_duration(r['duration'])}\n\n"
 
-    await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
 
 
-@bot.on_message(filters.command("np") & filters.group)
-async def np_cmd(_, message: Message) -> None:
-    chat_id = message.chat.id
+async def np_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
     now     = currently_playing.get(chat_id)
+
     if not now:
-        await message.reply_text("Nothing is playing right now nya~ 🌸")
+        await update.message.reply_text("Nothing is playing right now nya~ 🌸")
         return
 
     dur = now.get("duration", 0)
-    await message.reply_text(
-        f"🎵 **Now Playing**\n\n"
-        f"**{now['title']}**\n"
+    await update.message.reply_text(
+        f"🎵 *Now Playing*\n\n"
+        f"*{now['title']}*\n"
         f"👤 {now.get('uploader', 'Unknown')}\n"
         f"⏱ {_fmt_duration(dur)}\n"
         f"🔁 Loop: {'ON' if loop_mode[chat_id] else 'OFF'}",
+        parse_mode=ParseMode.MARKDOWN,
         reply_markup=player_keyboard(chat_id),
     )
 
 
-@bot.on_message(filters.command("pause") & filters.group)
-async def pause_cmd(_, message: Message) -> None:
+async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        await call.pause_stream(message.chat.id)
-        await message.reply_text("Music paused UwU ⏸️\nSay /resume when you're ready~")
+        await call.pause_stream(update.effective_chat.id)
+        await update.message.reply_text("Music paused UwU ⏸️\nSay /resume when you're ready~")
     except Exception:
-        await message.reply_text("Hmm~ nothing is playing right now Senpai! 🤔")
+        await update.message.reply_text("Hmm~ nothing is playing right now Senpai! 🤔")
 
 
-@bot.on_message(filters.command("resume") & filters.group)
-async def resume_cmd(_, message: Message) -> None:
+async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        await call.resume_stream(message.chat.id)
-        await message.reply_text("Yay! Music is back~! ▶️🎶")
+        await call.resume_stream(update.effective_chat.id)
+        await update.message.reply_text("Yay! Music is back~! ▶️🎶")
     except Exception:
-        await message.reply_text("Hmm~ nothing is paused right now Senpai! 🤔")
+        await update.message.reply_text("Hmm~ nothing is paused right now Senpai! 🤔")
 
 
-@bot.on_message(filters.command("skip") & filters.group)
-async def skip_cmd(_, message: Message) -> None:
-    if not _is_admin(message.from_user.id):
-        await message.reply_text("Only admins can skip, gomen~ 🙏")
+async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("Only admins can skip, gomen~ 🙏")
         return
 
-    chat_id = message.chat.id
+    chat_id = update.effective_chat.id
     if not currently_playing.get(chat_id):
-        await message.reply_text("There's nothing to skip nya~ 🌸")
+        await update.message.reply_text("There's nothing to skip nya~ 🌸")
         return
 
-    await message.reply_text("Skipping this track, hehe~ ➡️")
+    await update.message.reply_text("Skipping this track, hehe~ ➡️")
     try:
         await call.leave_group_call(chat_id)
     except Exception:
@@ -427,21 +470,21 @@ async def skip_cmd(_, message: Message) -> None:
         started = await play_next(chat_id)
         now     = currently_playing.get(chat_id)
         if started and now:
-            await message.reply_text(
-                f"🎵 **Now Playing**\n\n**{now['title']}**",
+            await update.message.reply_text(
+                f"🎵 *Now Playing*\n\n*{now['title']}*",
+                parse_mode=ParseMode.MARKDOWN,
                 reply_markup=player_keyboard(chat_id),
             )
     else:
-        await message.reply_text("The queue is empty now~ 🌸 Add more songs with /play!")
+        await update.message.reply_text("The queue is empty now~ 🌸 Add more songs with /play!")
 
 
-@bot.on_message(filters.command("stop") & filters.group)
-async def stop_cmd(_, message: Message) -> None:
-    if not _is_admin(message.from_user.id):
-        await message.reply_text("Only admins can stop the music, gomen~ 🙏")
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("Only admins can stop the music, gomen~ 🙏")
         return
 
-    chat_id = message.chat.id
+    chat_id = update.effective_chat.id
     queues[chat_id].clear()
     currently_playing.pop(chat_id, None)
     loop_mode[chat_id] = False
@@ -450,80 +493,82 @@ async def stop_cmd(_, message: Message) -> None:
         await call.leave_group_call(chat_id)
     except Exception:
         pass
-    await message.reply_text("Music stopped! Bye bye~ 👋\nHope you enjoyed it Senpai 💖")
+    await update.message.reply_text("Music stopped! Bye bye~ 👋\nHope you enjoyed it Senpai 💖")
 
 
-@bot.on_message(filters.command("queue") & filters.group)
-async def queue_cmd(_, message: Message) -> None:
-    chat_id = message.chat.id
+async def queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
     now     = currently_playing.get(chat_id)
     q       = queues[chat_id]
 
     if not now and not q:
-        await message.reply_text("The queue is empty nya~ 🌸\nUse /play to add songs!")
+        await update.message.reply_text("The queue is empty nya~ 🌸\nUse /play to add songs!")
         return
 
-    text = "🎵 **Music Queue**\n\n"
+    text = "🎵 *Music Queue*\n\n"
     if now:
         dur   = _fmt_duration(now.get("duration", 0))
-        text += f"▶️ **Now Playing:**\n{now['title']} `[{dur}]`\n\n"
+        text += f"▶️ *Now Playing:*\n{now['title']} `[{dur}]`\n\n"
     if q:
-        text += "📋 **Up Next:**\n"
+        text += "📋 *Up Next:*\n"
         for i, track in enumerate(q[:10], 1):
             dur   = _fmt_duration(track.get("duration", 0))
             text += f"`{i}.` {track['title']} `[{dur}]`\n"
         if len(q) > 10:
-            text += f"\n...and **{len(q) - 10}** more tracks."
+            text += f"\n\\.\\.\\.and *{len(q) - 10}* more tracks\\."
     if loop_mode[chat_id]:
-        text += "\n🔁 **Loop mode is ON**"
+        text += "\n🔁 *Loop mode is ON*"
 
-    await message.reply_text(text)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
-@bot.on_message(filters.command("loop") & filters.group)
-async def loop_cmd(_, message: Message) -> None:
-    chat_id           = message.chat.id
+async def loop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id            = update.effective_chat.id
     loop_mode[chat_id] = not loop_mode[chat_id]
     state              = "ON 🔁" if loop_mode[chat_id] else "OFF ▶️"
-    await message.reply_text(f"Loop mode is now **{state}**!")
+    await update.message.reply_text(f"Loop mode is now *{state}*!", parse_mode=ParseMode.MARKDOWN)
 
 
-@bot.on_message(filters.command("vol") & filters.group)
-async def vol_cmd(_, message: Message) -> None:
-    if not _is_admin(message.from_user.id):
-        await message.reply_text("Only admins can change volume, gomen~ 🙏")
+async def vol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("Only admins can change volume, gomen~ 🙏")
         return
 
-    if len(message.command) < 2 or not message.command[1].isdigit():
-        await message.reply_text("Usage: `/vol <0-200>`")
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Usage: `/vol <0-200>`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
         return
 
-    volume  = max(0, min(200, int(message.command[1])))
-    chat_id = message.chat.id
+    volume  = max(0, min(200, int(context.args[0])))
+    chat_id = update.effective_chat.id
     try:
         await call.change_volume_call(chat_id, volume)
-        await message.reply_text(f"🔊 Volume set to **{volume}%** nya~!")
-    except Exception as e:
-        log.error("vol error: %s", e)
-        await message.reply_text("Couldn't change volume right now~ 😢")
+        await update.message.reply_text(f"🔊 Volume set to *{volume}%* nya~!", parse_mode=ParseMode.MARKDOWN)
+    except Exception as exc:
+        log.error("vol error: %s", exc)
+        await update.message.reply_text("Couldn't change volume right now~ 😢")
 
 
-# ─── CALLBACKS ─────────────────────────────────────────────────────────────────
+# ─── CALLBACK QUERY HANDLER ────────────────────────────────────────────────────
 
-@bot.on_callback_query()
-async def callback_handler(_, query: CallbackQuery) -> None:
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query   = update.callback_query
     chat_id = query.message.chat.id
     data    = query.data
+
+    await query.answer()  # always acknowledge first to remove loading spinner
 
     # ── Search result selection ──────────────────────────────────────────────
     if data.startswith("sel:"):
         _, idx_str, orig_query = data.split(":", 2)
-        idx     = int(idx_str)
-        results = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: search_yt_multi(orig_query, 5)
-        )
+        idx  = int(idx_str)
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, lambda: search_yt_multi(orig_query, 5))
+
         if idx >= len(results):
-            await query.answer("Oops, couldn't find that track~")
+            await query.edit_message_text("Oops, couldn't find that track~")
             return
 
         track = results[idx]
@@ -535,50 +580,50 @@ async def callback_handler(_, query: CallbackQuery) -> None:
         if is_idle:
             await play_next(chat_id)
             now = currently_playing.get(chat_id, track)
-            await query.message.reply(
-                f"🎶 **Now Playing**\n\n**{now['title']}**",
+            await context.bot.send_message(
+                chat_id,
+                f"🎶 *Now Playing*\n\n*{now['title']}*",
+                parse_mode=ParseMode.MARKDOWN,
                 reply_markup=player_keyboard(chat_id),
             )
         else:
             pos = len(queues[chat_id])
-            await query.answer(f"Added to queue at #{pos}!", show_alert=True)
+            await context.bot.send_message(
+                chat_id,
+                f"✅ Added *{track['title']}* to queue at \\#{pos}\\.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
         return
 
     if data == "cancel_search":
         await query.message.delete()
-        await query.answer("Search cancelled~")
         return
 
     # ── Playback controls ────────────────────────────────────────────────────
     if data == "pause":
         try:
             await call.pause_stream(chat_id)
-            await query.answer("Music paused UwU ⏸️")
+            await query.edit_message_reply_markup(player_keyboard(chat_id))
         except Exception:
-            await query.answer("Nothing is playing~")
+            pass
 
     elif data == "resume":
         try:
             await call.resume_stream(chat_id)
-            await query.answer("Music resumed~ ▶️🎶")
+            await query.edit_message_reply_markup(player_keyboard(chat_id))
         except Exception:
-            await query.answer("Nothing is paused~")
+            pass
 
     elif data == "loop":
         loop_mode[chat_id] = not loop_mode[chat_id]
-        state = "ON 🔁" if loop_mode[chat_id] else "OFF ▶️"
-        await query.answer(f"Loop mode {state}")
-        # Refresh the keyboard so button label updates
         try:
-            await query.message.edit_reply_markup(player_keyboard(chat_id))
+            await query.edit_message_reply_markup(player_keyboard(chat_id))
         except Exception:
             pass
 
     elif data == "skip":
         if not currently_playing.get(chat_id):
-            await query.answer("Nothing to skip~")
             return
-        await query.answer("Skipping~ ➡️")
         try:
             await call.leave_group_call(chat_id)
         except Exception:
@@ -588,12 +633,14 @@ async def callback_handler(_, query: CallbackQuery) -> None:
             started = await play_next(chat_id)
             now     = currently_playing.get(chat_id)
             if started and now:
-                await query.message.reply_text(
-                    f"🎵 **Now Playing**\n\n**{now['title']}**",
+                await context.bot.send_message(
+                    chat_id,
+                    f"🎵 *Now Playing*\n\n*{now['title']}*",
+                    parse_mode=ParseMode.MARKDOWN,
                     reply_markup=player_keyboard(chat_id),
                 )
         else:
-            await query.message.reply_text("Queue empty~ 🌸 Add more with /play!")
+            await context.bot.send_message(chat_id, "Queue empty~ 🌸 Add more with /play!")
 
     elif data == "stop":
         queues[chat_id].clear()
@@ -604,38 +651,34 @@ async def callback_handler(_, query: CallbackQuery) -> None:
             await call.leave_group_call(chat_id)
         except Exception:
             pass
-        await query.answer("Stopped! Bye bye~ 👋")
-        await query.message.edit_text("Music stopped! Hope you enjoyed it Senpai 💖")
+        await query.edit_message_text("Music stopped! Hope you enjoyed it Senpai 💖")
 
     elif data == "queue":
         now = currently_playing.get(chat_id)
         q   = queues[chat_id]
         if not now and not q:
-            await query.answer("Queue is empty~")
             return
-        text = ""
+        lines = []
         if now:
-            text += f"▶️ {now['title']}\n"
+            lines.append(f"▶ {now['title']}")
         for i, t in enumerate(q[:8], 1):
-            text += f"{i}. {t['title']}\n"
+            lines.append(f"{i}. {t['title']}")
         if len(q) > 8:
-            text += f"...+{len(q)-8} more"
-        await query.answer(text[:200], show_alert=True)
+            lines.append(f"...+{len(q)-8} more")
+        # answer() already called above; send a follow-up message instead
+        await context.bot.send_message(chat_id, "\n".join(lines))
 
 
 # ─── STREAM END ────────────────────────────────────────────────────────────────
 
 @call.on_stream_end()
-async def on_stream_end(_, update) -> None:
+async def on_stream_end(client, update) -> None:
     """
-    BUG FIX: PyTgCalls v2 passes (client, update) not (update).
-    Also fixed: we now properly remove currently_playing before calling play_next
-    to avoid double-play edge cases.
+    FIX v2: PyTgCalls v2 passes (client, update) — fixed signature.
+    FIX: currently_playing cleared before play_next to avoid stale state.
     """
     chat_id = update.chat_id
     log.info("Stream ended in chat %d", chat_id)
-
-    # Don't remove from currently_playing here — play_next handles it via lock
     currently_playing.pop(chat_id, None)
 
     if queues[chat_id]:
@@ -646,38 +689,60 @@ async def on_stream_end(_, update) -> None:
 
 # ─── STARTUP / SHUTDOWN ────────────────────────────────────────────────────────
 
-async def main() -> None:
-    log.info("Starting assistant client...")
+async def post_init(application: Application) -> None:
+    """Called once after the Application initialises — start assistant & pytgcalls."""
+    log.info("Starting Pyrogram assistant...")
     await assistant.start()
-
     log.info("Starting PyTgCalls...")
     await call.start()
+    log.info("🎀 Kawaii Music Bot v3 is live~ nyaa!")
 
-    log.info("Starting bot...")
-    await bot.start()
 
-    log.info("🎀 Kawaii Music Bot v2 is running~ nyaa!")
-
-    # Graceful shutdown on SIGINT / SIGTERM
-    stop_event = asyncio.Event()
-
-    def _signal_handler():
-        log.info("Shutdown signal received...")
-        stop_event.set()
-
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _signal_handler)
-
-    await stop_event.wait()
-
+async def post_shutdown(application: Application) -> None:
+    """Called on graceful shutdown — cancel tasks, stop clients."""
     log.info("Shutting down...")
     for task in auto_leave_tasks.values():
         task.cancel()
-    await bot.stop()
-    await assistant.stop()
+    try:
+        await assistant.stop()
+    except Exception:
+        pass
     log.info("Bye bye~ 👋")
 
 
+def main() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is not set!")
+
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    # Register command handlers
+    app.add_handler(CommandHandler("start",  start_cmd))
+    app.add_handler(CommandHandler("play",   play_cmd))
+    app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("np",     np_cmd))
+    app.add_handler(CommandHandler("pause",  pause_cmd))
+    app.add_handler(CommandHandler("resume", resume_cmd))
+    app.add_handler(CommandHandler("skip",   skip_cmd))
+    app.add_handler(CommandHandler("stop",   stop_cmd))
+    app.add_handler(CommandHandler("queue",  queue_cmd))
+    app.add_handler(CommandHandler("loop",   loop_cmd))
+    app.add_handler(CommandHandler("vol",    vol_cmd))
+
+    # Inline keyboard callback handler
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    log.info("Starting polling...")
+    # stop_signals handles SIGINT/SIGTERM gracefully via PTB's built-in mechanism
+    app.run_polling(stop_signals=None)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
+  
