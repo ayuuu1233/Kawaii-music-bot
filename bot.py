@@ -121,12 +121,20 @@ def _run_health_server() -> None:
     Runs in a daemon thread — dies automatically when main process exits.
     """
     class Handler(BaseHTTPRequestHandler):
+        
         def do_GET(self):
             self.send_response(200)
             self.send_header("Content-type", "text/plain; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write("Kawaii Music Bot is alive~ nyaa! 🎀".encode("utf-8"))
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
         def log_message(self, *args):
             pass  # silence noisy access logs
 
