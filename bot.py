@@ -236,7 +236,7 @@ async def _schedule_auto_leave(chat_id: int) -> None:
         await asyncio.sleep(AUTO_LEAVE_SECS)
         if not currently_playing.get(chat_id) and not queues.get(chat_id):
             try:
-                await call.leave_group_call(chat_id)
+                await call.leave_call(chat_id)
                 log.info("Auto-left VC in chat %d after %ds idle", chat_id, AUTO_LEAVE_SECS)
             except Exception:
                 pass
@@ -267,7 +267,7 @@ async def play_next(chat_id: int) -> bool:
         try:
             await call.play(
                 chat_id,
-                MediaStream(track["url"], audio_quality=AudioQuality.STUDIO),
+                MediaStream(track["url"], audio_quality=AudioQuality.HIGH),
             )
             log.info("Now playing in %d: %s", chat_id, track["title"])
             return True
@@ -461,7 +461,7 @@ async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text("Skipping this track, hehe~ ➡️")
     try:
-        await call.leave_group_call(chat_id)
+        await call.leave_call(chat_id)
     except Exception:
         pass
     currently_playing.pop(chat_id, None)
@@ -490,7 +490,7 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     loop_mode[chat_id] = False
     await _cancel_auto_leave(chat_id)
     try:
-        await call.leave_group_call(chat_id)
+        await call.leave_call(chat_id)
     except Exception:
         pass
     await update.message.reply_text("Music stopped! Bye bye~ 👋\nHope you enjoyed it Senpai 💖")
@@ -625,7 +625,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not currently_playing.get(chat_id):
             return
         try:
-            await call.leave_group_call(chat_id)
+            await call.leave_call(chat_id)
         except Exception:
             pass
         currently_playing.pop(chat_id, None)
@@ -648,7 +648,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         loop_mode[chat_id] = False
         await _cancel_auto_leave(chat_id)
         try:
-            await call.leave_group_call(chat_id)
+            await call.leave_call(chat_id)
         except Exception:
             pass
         await query.edit_message_text("Music stopped! Hope you enjoyed it Senpai 💖")
@@ -674,10 +674,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 @call.on_stream_end()
 async def on_stream_end(client, update) -> None:
     """
-    FIX v2: PyTgCalls v2 passes (client, update) — fixed signature.
-    FIX: currently_playing cleared before play_next to avoid stale state.
+    FIX: py-tgcalls 2.x passes (client, update) with update.chat_id.
+    currently_playing cleared before play_next to avoid stale state.
     """
-    chat_id = update.chat_id
+    # py-tgcalls 2.x: update.chat_id holds the group chat id
+    chat_id = getattr(update, "chat_id", None)
+    if chat_id is None:
+        return
     log.info("Stream ended in chat %d", chat_id)
     currently_playing.pop(chat_id, None)
 
@@ -694,7 +697,8 @@ async def post_init(application: Application) -> None:
     log.info("Starting Pyrogram assistant...")
     await assistant.start()
     log.info("Starting PyTgCalls...")
-    await call.start()
+    # py-tgcalls 2.x: call.start() is synchronous (not a coroutine)
+    call.start()
     log.info("🎀 Kawaii Music Bot v3 is live~ nyaa!")
 
 
@@ -745,4 +749,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-  
