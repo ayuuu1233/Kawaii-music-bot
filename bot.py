@@ -44,7 +44,8 @@ from typing import Optional
 import yt_dlp
 from pyrogram import Client as PyrogramClient
 from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioQuality, MediaStream
+from pytgcalls.types import StreamEnded
+from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
 from telegram import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -671,13 +672,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 # ─── STREAM END ────────────────────────────────────────────────────────────────
 
-@call.on_stream_end()
+@call.on_update(StreamEnded)
 async def on_stream_end(client, update) -> None:
-    """
-    FIX: py-tgcalls 2.x passes (client, update) with update.chat_id.
-    currently_playing cleared before play_next to avoid stale state.
-    """
-    # py-tgcalls 2.x: update.chat_id holds the group chat id
     chat_id = getattr(update, "chat_id", None)
     if chat_id is None:
         return
@@ -688,7 +684,6 @@ async def on_stream_end(client, update) -> None:
         await play_next(chat_id)
     else:
         await _schedule_auto_leave(chat_id)
-
 
 # ─── STARTUP / SHUTDOWN ────────────────────────────────────────────────────────
 
