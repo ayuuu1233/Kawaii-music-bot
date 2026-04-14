@@ -124,8 +124,7 @@ def _run_health_server() -> None:
         def do_GET(self):
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"Kawaii Music Bot is alive~ nyaa! 🎀")
-
+            self.wfile.write("Kawaii Music Bot is alive~ nyaa! 🎀".encode())
         def log_message(self, *args):
             pass  # silence noisy access logs
 
