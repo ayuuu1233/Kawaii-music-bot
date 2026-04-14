@@ -1,5 +1,14 @@
+# python-telegram-bot — bot framework (v20+ async)
 python-telegram-bot==21.6
+
+# Pyrogram — MTProto client for the assistant account (voice chat)
 pyrogram==2.0.106
-pytgcalls==4.0.0
+
+# py-tgcalls — voice chat streaming (NOTE: package name on PyPI is "py-tgcalls", NOT "pytgcalls")
+py-tgcalls==2.2.11
+
+# yt-dlp — YouTube audio extraction
 yt-dlp>=2024.1.1
+
+# TgCrypto — fast crypto for Pyrogram (strongly recommended)
 TgCrypto
