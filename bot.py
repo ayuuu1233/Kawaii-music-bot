@@ -323,7 +323,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "🎵 /np — Now playing\n\n"
             "Let's make some music magic, nya~\\! ✨"
         ),
-        parse_mode=ParseMode.MARKDOWN_V2,
+        parse_mode=ParseMode.HTML,
     )
     await msg.delete()
 
@@ -335,14 +335,14 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "Ara ara~ tell me what to play Senpai\\! 🎵\n"
             "Usage: `/play <song name or YouTube URL>`",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.HTML,
         )
         return
 
     query         = " ".join(context.args)
     searching_msg = await update.message.reply_text(
         f"🔍 Searching for *{query}*\\.\\.\\. please wait nya~",
-        parse_mode=ParseMode.MARKDOWN_V2,
+        parse_mode=ParseMode.HTML,
     )
 
     loop  = asyncio.get_running_loop()
@@ -392,14 +392,14 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not context.args:
         await update.message.reply_text(
             "Usage: `/search <song name>`",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.HTML,
         )
         return
 
     query = " ".join(context.args)
     msg   = await update.message.reply_text(
         f"🔍 Searching for top results: *{query}*\\.\\.\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
+        parse_mode=ParseMode.HTML,
     )
 
     loop    = asyncio.get_running_loop()
@@ -694,6 +694,10 @@ async def on_stream_end(client, update) -> None:
     else:
         await _schedule_auto_leave(chat_id)
 
+# ─── ERROR HANDLER ─────────────────────────────────────────
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("🔥 Exception while handling update:", exc_info=context.error)
 
 # ─── STARTUP / SHUTDOWN ────────────────────────────────────────────────────────
 
@@ -746,6 +750,8 @@ def main() -> None:
     app.add_handler(CommandHandler("vol",    vol_cmd))
 
     app.add_handler(CallbackQueryHandler(callback_handler))
+    
+    app.add_error_handler(error_handler)
 
     log.info("Starting polling...")
     app.run_polling(stop_signals=None)
