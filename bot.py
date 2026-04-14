@@ -1,6 +1,11 @@
 """
-🎀 Kawaii Telegram Music Bot  v3.0
+🎀 Kawaii Telegram Music Bot  v3.1
 Rewritten with python-telegram-bot v20+ (async) + pytgcalls + yt-dlp
+
+CHANGES FROM v3.0:
+  - Added dummy HTTP health server for Render Web Service compatibility
+  - threading.Thread runs health server in background (daemon=True)
+  - PORT env var respected (default 8080)
 
 CHANGES FROM v2 (pyrogram):
   - Migrated from pyrogram → python-telegram-bot v20+ (full async)
@@ -15,7 +20,7 @@ BUG FIXES (same as v2):
   - typing_effect now accepts msg as explicit parameter
   - start_cmd properly awaits reply_video + cleans up placeholder
   - play_next guarded with per-chat asyncio.Lock (no race condition)
-  - on_stream_end signature fixed for pytgcalls v2 (client, update)
+  - on_stream_end signature fixed for pytgcalls v4 (on_update + StreamEnded)
   - asyncio.get_event_loop() replaced everywhere with get_running_loop()
 
 FEATURES:
@@ -33,18 +38,20 @@ FEATURES:
   - Per-chat asyncio.Lock prevents double-play race conditions
   - Structured logging
   - Retry logic on yt-dlp failures
+  - Dummy HTTP health server for Render free tier (Web Service)
 """
 
 import asyncio
 import logging
 import os
+import threading
 from collections import defaultdict
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 
 import yt_dlp
 from pyrogram import Client as PyrogramClient
 from pytgcalls import PyTgCalls
-from pytgcalls.types import StreamEnded
 from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
 from telegram import (
     CallbackQuery,
@@ -83,8 +90,6 @@ ADMIN_IDS       = (
 AUTO_LEAVE_SECS = int(os.environ.get("AUTO_LEAVE_SECS", "120"))  # 0 = never
 
 # ─── PYROGRAM ASSISTANT + PYTGCALLS ────────────────────────────────────────────
-# python-telegram-bot handles the bot commands/messages.
-# Pyrogram assistant account handles the actual voice chat streaming via pytgcalls.
 assistant = PyrogramClient(
     "assistant",
     api_id=API_ID,
@@ -97,22 +102,42 @@ call = PyTgCalls(assistant)
 queues:            dict[int, list[dict]]      = defaultdict(list)
 currently_playing: dict[int, Optional[dict]]  = {}
 loop_mode:         dict[int, bool]            = defaultdict(bool)
-# FIX: defaultdict(asyncio.Lock) doesn't work — Lock must be created per-chat lazily
 _chat_locks:       dict[int, asyncio.Lock]    = {}
 auto_leave_tasks:  dict[int, asyncio.Task]    = {}
 
 
 def _get_lock(chat_id: int) -> asyncio.Lock:
-    """Lazily create per-chat asyncio.Lock (fixes defaultdict(asyncio.Lock) issue)."""
+    """Lazily create per-chat asyncio.Lock."""
     if chat_id not in _chat_locks:
         _chat_locks[chat_id] = asyncio.Lock()
     return _chat_locks[chat_id]
 
 
+# ─── HEALTH SERVER (Render free tier fix) ─────────────────────────────────────
+
+def _run_health_server() -> None:
+    """
+    Dummy HTTP server so Render's port scan doesn't kill the process.
+    Runs in a daemon thread — dies automatically when main process exits.
+    """
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Kawaii Music Bot is alive~ nyaa! 🎀")
+
+        def log_message(self, *args):
+            pass  # silence noisy access logs
+
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    log.info("Health server listening on port %d", port)
+    server.serve_forever()
+
+
 # ─── HELPERS ───────────────────────────────────────────────────────────────────
 
 def _is_admin(user_id: int) -> bool:
-    """Return True when ADMIN_IDS is empty (open-to-all) or user is listed."""
     return not ADMIN_IDS or user_id in ADMIN_IDS
 
 
@@ -130,10 +155,6 @@ def _fmt_duration(secs: int) -> str:
 
 
 async def typing_effect(msg: Message, text: str, delay: float = 0.03) -> None:
-    """
-    Progressive typing animation by repeatedly editing *msg*.
-    FIX: receives msg as an explicit parameter — v2 had 'msg' undefined here.
-    """
     typed = ""
     for ch in text:
         typed += ch
@@ -176,7 +197,6 @@ def _ydl_opts(extra: dict | None = None) -> dict:
 
 
 def search_yt(query: str, retries: int = 2) -> Optional[dict]:
-    """Synchronous: search YouTube, return best audio info. Retries on failure."""
     opts = _ydl_opts({"default_search": "ytsearch1"})
     for attempt in range(retries + 1):
         try:
@@ -199,7 +219,6 @@ def search_yt(query: str, retries: int = 2) -> Optional[dict]:
 
 
 def search_yt_multi(query: str, count: int = 5) -> list[dict]:
-    """Synchronous: return top *count* YouTube results for query."""
     opts = _ydl_opts({"default_search": f"ytsearch{count}"})
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -247,12 +266,6 @@ async def _schedule_auto_leave(chat_id: int) -> None:
 
 
 async def play_next(chat_id: int) -> bool:
-    """
-    Pop the next track from the queue and begin streaming.
-    FIX: wrapped in per-chat Lock so concurrent skip/stream-end calls don't
-    trigger double-play.
-    Returns True if a track was started.
-    """
     async with _get_lock(chat_id):
         if not queues[chat_id]:
             currently_playing.pop(chat_id, None)
@@ -281,7 +294,6 @@ async def play_next(chat_id: int) -> bool:
 # ─── COMMAND HANDLERS ──────────────────────────────────────────────────────────
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """FIX: reply_video properly awaited; 'text' variable removed; msg properly passed."""
     name = update.effective_user.first_name if update.effective_user else "Senpai"
     msg  = await update.message.reply_text("💖 Starting... UwU")
 
@@ -292,7 +304,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await typing_effect(msg, f"🌸 Welcome {name}-senpai~! 💕")
     await asyncio.sleep(0.6)
 
-    # FIX: reply_video now properly awaited and caption defined inline
     await update.message.reply_video(
         video="https://files.catbox.moe/9w0qsn.mp4",
         caption=(
@@ -333,7 +344,6 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
-    # FIX: use get_running_loop() instead of deprecated get_event_loop()
     loop  = asyncio.get_running_loop()
     track = await loop.run_in_executor(None, search_yt, query)
 
@@ -559,13 +569,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat_id = query.message.chat.id
     data    = query.data
 
-    await query.answer()  # always acknowledge first to remove loading spinner
+    await query.answer()
 
-    # ── Search result selection ──────────────────────────────────────────────
     if data.startswith("sel:"):
         _, idx_str, orig_query = data.split(":", 2)
-        idx  = int(idx_str)
-        loop = asyncio.get_running_loop()
+        idx     = int(idx_str)
+        loop    = asyncio.get_running_loop()
         results = await loop.run_in_executor(None, lambda: search_yt_multi(orig_query, 5))
 
         if idx >= len(results):
@@ -600,7 +609,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.message.delete()
         return
 
-    # ── Playback controls ────────────────────────────────────────────────────
     if data == "pause":
         try:
             await call.pause_stream(chat_id)
@@ -666,7 +674,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             lines.append(f"{i}. {t['title']}")
         if len(q) > 8:
             lines.append(f"...+{len(q)-8} more")
-        # answer() already called above; send a follow-up message instead
         await context.bot.send_message(chat_id, "\n".join(lines))
 
 
@@ -674,6 +681,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 @call.on_update(StreamEnded)
 async def on_stream_end(client, update) -> None:
+    """pytgcalls v4+: use on_update(StreamEnded) instead of on_stream_end()."""
     chat_id = getattr(update, "chat_id", None)
     if chat_id is None:
         return
@@ -685,20 +693,18 @@ async def on_stream_end(client, update) -> None:
     else:
         await _schedule_auto_leave(chat_id)
 
+
 # ─── STARTUP / SHUTDOWN ────────────────────────────────────────────────────────
 
 async def post_init(application: Application) -> None:
-    """Called once after the Application initialises — start assistant & pytgcalls."""
     log.info("Starting Pyrogram assistant...")
     await assistant.start()
     log.info("Starting PyTgCalls...")
-    # py-tgcalls 2.x: call.start() is synchronous (not a coroutine)
     call.start()
-    log.info("🎀 Kawaii Music Bot v3 is live~ nyaa!")
+    log.info("🎀 Kawaii Music Bot v3.1 is live~ nyaa!")
 
 
 async def post_shutdown(application: Application) -> None:
-    """Called on graceful shutdown — cancel tasks, stop clients."""
     log.info("Shutting down...")
     for task in auto_leave_tasks.values():
         task.cancel()
@@ -713,6 +719,11 @@ def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is not set!")
 
+    # ── Render free tier fix ─────────────────────────────────────────────────
+    # Render Web Service kills processes that don't bind a port.
+    # This dummy HTTP server satisfies the port scan while the bot runs normally.
+    threading.Thread(target=_run_health_server, daemon=True).start()
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -721,7 +732,6 @@ def main() -> None:
         .build()
     )
 
-    # Register command handlers
     app.add_handler(CommandHandler("start",  start_cmd))
     app.add_handler(CommandHandler("play",   play_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
@@ -734,13 +744,12 @@ def main() -> None:
     app.add_handler(CommandHandler("loop",   loop_cmd))
     app.add_handler(CommandHandler("vol",    vol_cmd))
 
-    # Inline keyboard callback handler
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     log.info("Starting polling...")
-    # stop_signals handles SIGINT/SIGTERM gracefully via PTB's built-in mechanism
     app.run_polling(stop_signals=None)
 
 
 if __name__ == "__main__":
     main()
+  
