@@ -1,8 +1,8 @@
 # python-telegram-bot — bot framework (v20+ async)
 python-telegram-bot==21.6
 
-# Pyrogram — MTProto client for the assistant account (voice chat)
-pyrogram==2.0.106
+# Pyrofork — MTProto client for the assistant account (voice chat)
+pyrofork
 
 # py-tgcalls — voice chat streaming (NOTE: package name on PyPI is "py-tgcalls", NOT "pytgcalls")
 py-tgcalls==2.2.11
