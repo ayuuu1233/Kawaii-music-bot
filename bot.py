@@ -84,6 +84,13 @@ ADMIN_IDS: list[int] = (
 )
 AUTO_LEAVE_SECS = int(os.environ.get("AUTO_LEAVE_SECS", "120"))  # 0 = disabled
 
+# ─── SOURCES ────────────────────────────
+SOURCES = [
+    "ytsearch1",       # YouTube
+    "scsearch1",       # SoundCloud
+    "spsearch1",       # Spotify (via yt-dlp)
+]
+
 # ─── PYROGRAM ASSISTANT + PYTGCALLS ────────────────────────────────────────────
 assistant = PyrogramClient(
     "assistant",
@@ -207,47 +214,69 @@ def _ydl_opts(extra: dict | None = None) -> dict:
 
 
 def search_yt(query: str, retries: int = 2) -> Optional[dict]:
-    opts = _ydl_opts({"default_search": "ytsearch1"})
-    for attempt in range(retries + 1):
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(query, download=False)
-                if "entries" in info:
-                    info = info["entries"][0]
-                return {
-                    "title":       info.get("title", "Unknown"),
-                    "url":         info.get("url"),
-                    "duration":    info.get("duration", 0),
-                    "webpage_url": info.get("webpage_url", ""),
-                    "thumbnail":   info.get("thumbnail", ""),
-                    "uploader":    info.get("uploader", "Unknown"),
-                }
-        except Exception as exc:
-            log.warning("yt-dlp attempt %d/%d failed: %s", attempt + 1, retries + 1, exc)
-            if attempt == retries:
-                return None
+    """Try YouTube first, fallback to SoundCloud, then Spotify."""
+    for source in SOURCES:
+        opts = _ydl_opts({"default_search": source})
+        for attempt in range(retries + 1):
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(query, download=False)
+                    if "entries" in info:
+                        info = info["entries"][0]
+                    # Validate we got a playable URL
+                    url = info.get("url") or info.get("webpage_url")
+                    if not url:
+                        raise ValueError("No URL in result")
+                    log.info("Found via %s: %s", source, info.get("title"))
+                    return {
+                        "title":       info.get("title", "Unknown"),
+                        "url":         url,
+                        "duration":    info.get("duration", 0),
+                        "webpage_url": info.get("webpage_url", ""),
+                        "thumbnail":   info.get("thumbnail", ""),
+                        "uploader":    info.get("uploader", "Unknown"),
+                    }
+            except Exception as exc:
+                log.warning(
+                    "[%s] attempt %d/%d failed: %s",
+                    source, attempt + 1, retries + 1, exc
+                )
+    # All sources exhausted
+    log.error("All sources failed for query: %s", query)
+    return None
 
 
 def search_yt_multi(query: str, count: int = 5) -> list[dict]:
-    opts = _ydl_opts({"default_search": f"ytsearch{count}"})
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info    = ydl.extract_info(query, download=False)
-            entries = info.get("entries", [])
-            return [
-                {
-                    "title":       e.get("title", "Unknown"),
-                    "url":         e.get("url"),
-                    "duration":    e.get("duration", 0),
-                    "webpage_url": e.get("webpage_url", ""),
-                    "thumbnail":   e.get("thumbnail", ""),
-                    "uploader":    e.get("uploader", "Unknown"),
-                }
-                for e in entries if e
-            ]
-    except Exception as exc:
-        log.error("multi-search error: %s", exc)
-        return []
+    """Multi-result search with source fallback."""
+    multi_sources = [
+        f"ytsearch{count}",
+        f"scsearch{count}",
+        f"spsearch{count}",
+    ]
+    for source in multi_sources:
+        opts = _ydl_opts({"default_search": source})
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info    = ydl.extract_info(query, download=False)
+                entries = info.get("entries", [])
+                results = [
+                    {
+                        "title":       e.get("title", "Unknown"),
+                        "url":         e.get("url") or e.get("webpage_url", ""),
+                        "duration":    e.get("duration", 0),
+                        "webpage_url": e.get("webpage_url", ""),
+                        "thumbnail":   e.get("thumbnail", ""),
+                        "uploader":    e.get("uploader", "Unknown"),
+                    }
+                    for e in entries if e and (e.get("url") or e.get("webpage_url"))
+                ]
+                if results:
+                    log.info("Multi-search via %s: %d results", source, len(results))
+                    return results
+        except Exception as exc:
+            log.warning("multi-search [%s] failed: %s", source, exc)
+    log.error("All multi-search sources failed for: %s", query)
+    return []
 
 
 # ─── LYRICS (lyrics.ovh — free, no API key) ────────────────────────────────────
