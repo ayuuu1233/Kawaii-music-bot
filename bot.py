@@ -22,7 +22,7 @@ import httpx
 import yt_dlp
 from pyrogram import Client as PyrogramClient
 from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
+from pytgcalls.types import MediaStream, StreamEnded
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -327,9 +327,6 @@ async def _schedule_auto_leave(chat_id: int) -> None:
 
 
 async def play_next(chat_id: int, *, change_stream: bool = False) -> bool:
-    """
-    Pop next track, get a fresh stream URL, join VC with real stream.
-    """
     async with _get_lock(chat_id):
         if not queues[chat_id]:
             currently_playing.pop(chat_id, None)
@@ -353,16 +350,15 @@ async def play_next(chat_id: int, *, change_stream: bool = False) -> bool:
             currently_playing.pop(chat_id, None)
             return await play_next(chat_id, change_stream=change_stream)
 
-        stream = MediaStream(stream_url, audio_quality=AudioQuality.HIGH)
+        # ← FIX: No audio_quality parameter
+        stream = MediaStream(stream_url)
 
         try:
-            # CASE 1: Already in VC → change stream
             if change_stream and chat_id in _joined_chats:
                 await call.change_stream(chat_id, stream)
                 log.info("Changed stream in %d: %s", chat_id, track["title"])
                 return True
 
-            # CASE 2: Already joined → play directly
             if chat_id in _joined_chats:
                 try:
                     await call.play(chat_id, stream)
@@ -372,7 +368,6 @@ async def play_next(chat_id: int, *, change_stream: bool = False) -> bool:
                     log.warning("play() failed: %s", exc)
                     _joined_chats.discard(chat_id)
 
-            # CASE 3: Not in VC → join WITH real stream
             log.info("Joining VC %d with stream...", chat_id)
             await call.join_group_call(chat_id, stream)
             _joined_chats.add(chat_id)
@@ -383,7 +378,6 @@ async def play_next(chat_id: int, *, change_stream: bool = False) -> bool:
             log.error("Playback failed in %d: %s", chat_id, exc)
             _joined_chats.discard(chat_id)
 
-            # RETRY: leave + rejoin
             try:
                 await call.leave_call(chat_id)
             except Exception:
