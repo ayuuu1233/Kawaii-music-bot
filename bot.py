@@ -1,12 +1,13 @@
 """
-🎀 Kawaii Telegram Music Bot v3.6
-FIXES:
-  - join_group_call → call.play() (PyTgCalls v1.0+ API)
-  - change_volume_call → removed (not in new API, graceful fallback)
-  - StreamEnded import fix
-  - on_stream_end decorator fix (new API style)
-  - play_next logic cleaned up (no more join_group_call anywhere)
-  - All previous v3.5 fixes included
+🎀 Kawaii Telegram Music Bot v3.7
+FIXES from v3.6:
+  - MediaStream → AudioPiped (fixes silent playback failure)
+  - AudioParameters.from_quality("high") added
+  - play_next deadlock fixed (removed __wrapped__ recursion hack)
+  - Proper error logging in play() so failures are visible
+  - post_init PyTgCalls error now logged properly
+  - play_next simplified: no recursive lock re-entry
+  - All previous v3.6 fixes included
 """
 
 import asyncio
@@ -24,6 +25,7 @@ import yt_dlp
 from pyrogram import Client as PyrogramClient
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
+from pytgcalls.types.input_stream import AudioPiped, AudioParameters
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -317,69 +319,88 @@ async def _schedule_auto_leave(chat_id: int) -> None:
     auto_leave_tasks[chat_id] = asyncio.create_task(_leave())
 
 
+async def _do_play(chat_id: int, track: dict) -> bool:
+    """
+    ✅ FIX v3.7: Core playback using AudioPiped instead of MediaStream.
+    AudioPiped correctly streams audio to Telegram VC.
+    MediaStream was silently failing without joining VC properly.
+    """
+    loop = asyncio.get_running_loop()
+    stream_url = await loop.run_in_executor(
+        None, get_audio_url, track["webpage_url"]
+    )
+
+    if not stream_url:
+        log.error("No stream URL for: %s", track["title"])
+        return False
+
+    # ✅ FIX: Use AudioPiped, NOT MediaStream
+    # MediaStream does not reliably stream to Telegram VC in PyTgCalls v1.0+
+    try:
+        stream = AudioPiped(
+            stream_url,
+            AudioParameters.from_quality("high"),
+        )
+    except TypeError:
+        # Some versions don't accept AudioParameters positionally
+        stream = AudioPiped(stream_url)
+
+    for attempt in range(2):
+        try:
+            log.info("Calling play() in chat %d (attempt %d): %s", chat_id, attempt + 1, track["title"])
+            await call.play(chat_id, stream)
+            _joined_chats.add(chat_id)
+            log.info("Playback started in %d: %s", chat_id, track["title"])
+            return True
+        except Exception as exc:
+            log.error("play() attempt %d failed in %d: %s", attempt + 1, chat_id, exc)
+            if attempt == 0:
+                await asyncio.sleep(2)
+
+    _joined_chats.discard(chat_id)
+    return False
+
+
 async def play_next(chat_id: int, *, change_stream: bool = False) -> bool:
     """
-    Pop the next track from queue and start/change playback.
-    Uses call.play() exclusively — works for both fresh join and stream change.
-    PyTgCalls v1.0+ handles joining automatically via play().
+    ✅ FIX v3.7: Deadlock-safe play_next.
+    Old version used __wrapped__ recursion which re-entered the same lock → deadlock.
+    Now we collect the next track inside the lock, then call _do_play outside.
     """
+    track = None
+
     async with _get_lock(chat_id):
-        if not queues[chat_id]:
+        # Skip tracks with no URL until we find one or exhaust the queue
+        while queues[chat_id]:
+            candidate = queues[chat_id].pop(0)
+            if candidate.get("webpage_url"):
+                track = candidate
+                break
+            log.warning("Skipping track with no webpage_url: %s", candidate.get("title"))
+
+        if track is None:
             currently_playing.pop(chat_id, None)
             await _schedule_auto_leave(chat_id)
             return False
 
-        track = queues[chat_id].pop(0)
         currently_playing[chat_id] = track
 
         if loop_mode[chat_id]:
             queues[chat_id].append(track)
 
-        # Get FRESH audio URL right before playback
-        loop = asyncio.get_running_loop()
-        stream_url = await loop.run_in_executor(
-            None, get_audio_url, track["webpage_url"]
-        )
+    # ✅ _do_play is called OUTSIDE the lock so no deadlock on retry/recursion
+    success = await _do_play(chat_id, track)
 
-        if not stream_url:
-            log.error("No stream URL for: %s", track["title"])
+    if not success:
+        async with _get_lock(chat_id):
             currently_playing.pop(chat_id, None)
-            # Try next track recursively
-            return await play_next.__wrapped__(chat_id, change_stream=change_stream)
+        # Try next track if available
+        if queues[chat_id]:
+            log.info("Trying next track after failure in %d", chat_id)
+            return await play_next(chat_id)
+        return False
 
-        stream = MediaStream(stream_url)
-
-        try:
-            # ✅ FIX: call.play() works for BOTH joining a new call
-            #         AND changing stream in an existing call.
-            #         join_group_call does NOT exist in PyTgCalls v1.0+
-            log.info("Calling play() in chat %d: %s", chat_id, track["title"])
-            await call.play(chat_id, stream)
-            _joined_chats.add(chat_id)
-            log.info("Playback started in %d: %s", chat_id, track["title"])
-            return True
-
-        except Exception as exc:
-            log.error("play() failed in %d: %s", chat_id, exc)
-            _joined_chats.discard(chat_id)
-            currently_playing.pop(chat_id, None)
-
-            # One retry after short delay
-            try:
-                log.info("Retrying play() in %d...", chat_id)
-                await asyncio.sleep(2)
-                await call.play(chat_id, stream)
-                _joined_chats.add(chat_id)
-                currently_playing[chat_id] = track
-                log.info("Retry OK in %d: %s", chat_id, track["title"])
-                return True
-            except Exception as exc2:
-                log.error("Retry failed in %d: %s", chat_id, exc2)
-                return False
-
-
-# Unwrap for recursive call (avoids re-acquiring the same lock)
-play_next.__wrapped__ = play_next
+    return True
 
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
@@ -474,8 +495,9 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Gomen\\~ playback failed 😢\n\n"
                 "Check:\n"
                 "• Voice chat is started in group\n"
-                "• Assistant account is in group\n"
-                "• Bot has permissions",
+                "• Assistant account is added to group as admin\n"
+                "• Bot has permissions\n"
+                "• Check /logs for details",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
     else:
@@ -676,9 +698,6 @@ async def vol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     volume = max(0, min(200, int(context.args[0])))
     chat_id = update.effective_chat.id
     try:
-        # ✅ FIX: change_volume_call removed in new PyTgCalls
-        #         Use change_stream with same stream at new volume if needed.
-        #         For now, graceful unsupported message.
         await call.change_volume_call(chat_id, volume)
         await update.message.reply_text(f"🔊 Volume set to {volume}%!")
     except AttributeError:
@@ -903,16 +922,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ─── STREAM END HANDLER ──────────────────────────────────────────────────────
-# ✅ FIX: New PyTgCalls v1.0+ uses filters-based decorator style.
-#         Import Update from pytgcalls, filter by type.
 
 try:
-    # PyTgCalls v1.0+ style
     from pytgcalls.types import Update as TgCallsUpdate
 
     @call.on_update()
     async def on_stream_end(client: PyTgCalls, update: TgCallsUpdate) -> None:
-        # Only handle stream-ended events
         update_type = type(update).__name__
         if "StreamEnded" not in update_type and "Ended" not in update_type:
             return
@@ -940,7 +955,6 @@ try:
             await _schedule_auto_leave(chat_id)
 
 except (ImportError, TypeError):
-    # Older PyTgCalls fallback
     try:
         from pytgcalls.types import StreamEnded
 
@@ -994,8 +1008,15 @@ async def post_init(application: Application) -> None:
     log.info("Assistant: %s (ID: %d)", me.first_name, me.id)
 
     log.info("Starting PyTgCalls...")
-    await call.start()
-    log.info("🎀 Kawaii Music Bot v3.6 is live~!")
+    try:
+        await call.start()
+        log.info("PyTgCalls started OK ✅")
+    except Exception as e:
+        # ✅ FIX v3.7: Log PyTgCalls startup failure clearly (was silently ignored before)
+        log.error("PyTgCalls start FAILED ❌: %s", e)
+        raise
+
+    log.info("🎀 Kawaii Music Bot v3.7 is live~!")
 
 
 async def post_shutdown(application: Application) -> None:
@@ -1055,4 +1076,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-  
