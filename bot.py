@@ -25,7 +25,7 @@ import yt_dlp
 from pyrogram import Client as PyrogramClient
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
-from pytgcalls.types.input_stream import AudioPiped, AudioParameters
+from pytgcalls.types import AudioPiped, AudioParameters
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
