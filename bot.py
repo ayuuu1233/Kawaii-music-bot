@@ -1,17 +1,11 @@
 """
-🎀 Kawaii Telegram Music Bot v3.4
-All bugs fixed — python-telegram-bot v20+ (async) + pytgcalls + yt-dlp
-
-FIXES FROM v3.3:
-  - REMOVED _ensure_joined() with empty string MediaStream
-  - play_next: now joins VC WITH the actual audio stream directly
-  - join_group_call gets REAL MediaStream, not empty ""
-  - on_stream_end: handles all pytgcalls v4 update object variants
-  - Fresh audio URL extraction before every playback (no expired URLs)
-  - MarkdownV2 escaping fixed inside backtick blocks
-  - /logs command: escapes backticks in log content
-  - Auto-retry: leave + rejoin if first attempt fails
-  - Proper error messages when playback fails
+🎀 Kawaii Telegram Music Bot v3.5
+FIXES:
+  - YouTube cookies support (Render/VPS YouTube block fix)
+  - SoundCloud primary source (fallback when YT blocked)
+  - 409 Conflict handling with drop_pending_updates
+  - "Message to be replied not found" crash fixed
+  - All previous v3.4 fixes included
 """
 
 import asyncio
@@ -44,10 +38,9 @@ from telegram.ext import (
 )
 
 
-# ─── LOG BUFFER (for /logs command) ───────────────────────────────────────────
+# ─── LOG BUFFER ───────────────────────────────────────────────────────────────
 
 class LogBufferHandler(logging.Handler):
-    """Keeps the last `maxlen` log lines in memory."""
     def __init__(self, maxlen: int = 50):
         super().__init__()
         self.buffer: collections.deque[str] = collections.deque(maxlen=maxlen)
@@ -58,8 +51,6 @@ class LogBufferHandler(logging.Handler):
         except Exception:
             pass
 
-
-# ─── LOGGING ──────────────────────────────────────────────────────────────────
 
 _log_buffer_handler = LogBufferHandler(maxlen=50)
 _log_buffer_handler.setFormatter(
@@ -88,7 +79,11 @@ ADMIN_IDS: list[int] = (
 )
 AUTO_LEAVE_SECS = int(os.environ.get("AUTO_LEAVE_SECS", "120"))
 
-SOURCES = ["ytsearch1", "scsearch1"]
+# Cookie file path for YouTube (optional — put cookies.txt in project root)
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
+
+# Search order: SoundCloud FIRST (works without cookies), YouTube as fallback
+SOURCES = ["scsearch1", "ytsearch1"]
 
 
 # ─── PYROGRAM + PYTGCALLS ────────────────────────────────────────────────────
@@ -154,7 +149,6 @@ def _fmt_duration(secs: int) -> str:
 
 
 def _esc(text: str) -> str:
-    """Escape special chars for MarkdownV2."""
     for ch in r"\_*[]()~`>#+-=|{}.!":
         text = text.replace(ch, f"\\{ch}")
     return text
@@ -179,6 +173,28 @@ def player_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+async def _safe_reply(message, text: str, **kwargs):
+    """Send reply safely — if original message deleted, send to chat instead."""
+    try:
+        return await message.reply_text(text, **kwargs)
+    except Exception:
+        try:
+            return await message.get_bot().send_message(
+                chat_id=message.chat.id, text=text, **kwargs
+            )
+        except Exception as exc:
+            log.error("_safe_reply failed: %s", exc)
+            return None
+
+
+async def _safe_delete(message):
+    """Delete message safely — ignore if already deleted."""
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
 # ─── YT-DLP HELPERS ──────────────────────────────────────────────────────────
 
 def _ydl_opts(extra: dict | None = None) -> dict:
@@ -189,16 +205,17 @@ def _ydl_opts(extra: dict | None = None) -> dict:
         "noplaylist": True,
         "source_address": "0.0.0.0",
     }
+    # Add cookies if file exists
+    if os.path.isfile(COOKIES_FILE):
+        base["cookiefile"] = COOKIES_FILE
+        log.info("Using cookies from: %s", COOKIES_FILE)
     if extra:
         base.update(extra)
     return base
 
 
 def get_audio_url(webpage_url: str) -> Optional[str]:
-    """
-    Re-extract a FRESH direct audio stream URL right before playback.
-    YouTube signed URLs expire — never cache them, always re-fetch.
-    """
+    """Get a FRESH direct audio stream URL right before playback."""
     try:
         with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
             info = ydl.extract_info(webpage_url, download=False)
@@ -207,7 +224,7 @@ def get_audio_url(webpage_url: str) -> Optional[str]:
             url = info.get("url")
             if not url:
                 raise ValueError("No stream URL in yt-dlp result")
-            log.info("Fresh audio URL extracted for: %s", info.get("title"))
+            log.info("Fresh audio URL for: %s", info.get("title"))
             return url
     except Exception as exc:
         log.error("get_audio_url failed for %s: %s", webpage_url, exc)
@@ -215,7 +232,10 @@ def get_audio_url(webpage_url: str) -> Optional[str]:
 
 
 def search_yt(query: str, retries: int = 2) -> Optional[dict]:
-    """Search and return track metadata. URL here is webpage_url, NOT stream URL."""
+    """
+    Search for a track. Tries SoundCloud first (no cookies needed),
+    then YouTube as fallback.
+    """
     for source in SOURCES:
         opts = _ydl_opts({"default_search": source})
         for attempt in range(retries + 1):
@@ -236,14 +256,13 @@ def search_yt(query: str, retries: int = 2) -> Optional[dict]:
                         "uploader":    info.get("uploader", "Unknown"),
                     }
             except Exception as exc:
-                log.warning("[%s] attempt %d/%d failed: %s", source, attempt + 1, retries + 1, exc)
+                log.warning("[%s] attempt %d/%d: %s", source, attempt + 1, retries + 1, exc)
     log.error("All sources failed for: %s", query)
     return None
 
 
 def search_yt_multi(query: str, count: int = 5) -> list[dict]:
-    """Multi-result search. Returns metadata dicts (no stream URLs)."""
-    for source in [f"ytsearch{count}", f"scsearch{count}"]:
+    for source in [f"scsearch{count}", f"ytsearch{count}"]:
         try:
             with yt_dlp.YoutubeDL(_ydl_opts({"default_search": source})) as ydl:
                 info    = ydl.extract_info(query, download=False)
@@ -263,7 +282,7 @@ def search_yt_multi(query: str, count: int = 5) -> list[dict]:
                     log.info("Multi-search via %s: %d results", source, len(results))
                     return results
         except Exception as exc:
-            log.warning("multi-search [%s] failed: %s", source, exc)
+            log.warning("multi-search [%s]: %s", source, exc)
     return []
 
 
@@ -309,13 +328,7 @@ async def _schedule_auto_leave(chat_id: int) -> None:
 
 async def play_next(chat_id: int, *, change_stream: bool = False) -> bool:
     """
-    Pop next track, get a fresh stream URL, then start / change stream.
-
-    KEY FIX v3.4:
-    - No more _ensure_joined with empty string
-    - join_group_call gets the REAL audio stream directly
-    - Fresh URL extracted every time before playback
-    - Auto-retry with leave + rejoin if first attempt fails
+    Pop next track, get a fresh stream URL, join VC with real stream.
     """
     async with _get_lock(chat_id):
         if not queues[chat_id]:
@@ -329,44 +342,39 @@ async def play_next(chat_id: int, *, change_stream: bool = False) -> bool:
         if loop_mode[chat_id]:
             queues[chat_id].append(track)
 
-        # ── Get a FRESH audio URL (blocking yt-dlp call, run in thread) ──
+        # Get FRESH audio URL
         loop = asyncio.get_running_loop()
         stream_url = await loop.run_in_executor(
             None, get_audio_url, track["webpage_url"]
         )
 
         if not stream_url:
-            log.error("Could not get stream URL for: %s", track["title"])
+            log.error("No stream URL for: %s", track["title"])
             currently_playing.pop(chat_id, None)
-            # Try the next track automatically
             return await play_next(chat_id, change_stream=change_stream)
 
         stream = MediaStream(stream_url, audio_quality=AudioQuality.HIGH)
 
         try:
-            # ── CASE 1: Already in VC → just change the stream ──
+            # CASE 1: Already in VC → change stream
             if change_stream and chat_id in _joined_chats:
                 await call.change_stream(chat_id, stream)
                 log.info("Changed stream in %d: %s", chat_id, track["title"])
                 return True
 
-            # ── CASE 2: Already joined but not changing stream → play ──
+            # CASE 2: Already joined → play directly
             if chat_id in _joined_chats:
                 try:
                     await call.play(chat_id, stream)
                     log.info("Playing in %d: %s", chat_id, track["title"])
                     return True
                 except Exception as exc:
-                    log.warning("play() failed, will try fresh join: %s", exc)
+                    log.warning("play() failed: %s", exc)
                     _joined_chats.discard(chat_id)
-                    # Fall through to CASE 3
 
-            # ── CASE 3: Not in VC → join WITH the actual stream ──
-            log.info("Joining VC in chat %d with stream...", chat_id)
-            await call.join_group_call(
-                chat_id,
-                stream,  # ← REAL audio stream, NOT empty string!
-            )
+            # CASE 3: Not in VC → join WITH real stream
+            log.info("Joining VC %d with stream...", chat_id)
+            await call.join_group_call(chat_id, stream)
             _joined_chats.add(chat_id)
             log.info("Joined + playing in %d: %s", chat_id, track["title"])
             return True
@@ -375,21 +383,21 @@ async def play_next(chat_id: int, *, change_stream: bool = False) -> bool:
             log.error("Playback failed in %d: %s", chat_id, exc)
             _joined_chats.discard(chat_id)
 
-            # ── LAST RESORT: leave and rejoin fresh ──
+            # RETRY: leave + rejoin
             try:
                 await call.leave_call(chat_id)
             except Exception:
                 pass
 
             try:
-                log.info("Retrying fresh join for chat %d...", chat_id)
+                log.info("Retrying fresh join for %d...", chat_id)
                 await asyncio.sleep(2)
                 await call.join_group_call(chat_id, stream)
                 _joined_chats.add(chat_id)
-                log.info("Retry successful in %d: %s", chat_id, track["title"])
+                log.info("Retry OK in %d: %s", chat_id, track["title"])
                 return True
             except Exception as exc2:
-                log.error("Retry also failed in %d: %s", chat_id, exc2)
+                log.error("Retry failed in %d: %s", chat_id, exc2)
                 currently_playing.pop(chat_id, None)
                 return False
 
@@ -398,25 +406,24 @@ async def play_next(chat_id: int, *, change_stream: bool = False) -> bool:
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = update.effective_user.first_name if update.effective_user else "Senpai"
-
     caption = (
         f"Konnichiwa *{_esc(name)}*\\-senpai\\~ 💖\n\n"
         "I'm your kawaii music bot\\! 🎵\n\n"
         "*Commands:*\n"
         "🎶 /play `<song>` — Play a song\n"
-        "🔍 /search `<song>` — Pick from top 5 results\n"
+        "🔍 /search `<song>` — Pick from top 5\n"
         "⏸️ /pause — Pause\n"
         "▶️ /resume — Resume\n"
-        "⏭️ /skip — Skip current track\n"
-        "⏹️ /stop — Stop \\& clear queue\n"
+        "⏭️ /skip — Skip\n"
+        "⏹️ /stop — Stop \\& clear\n"
         "📋 /queue — Show queue\n"
-        "🔀 /shuffle — Shuffle queue\n"
+        "🔀 /shuffle — Shuffle\n"
         "🗑 /remove `<pos>` — Remove track\n"
-        "📝 /lyrics `<song>` — Show lyrics\n"
+        "📝 /lyrics `<song>` — Lyrics\n"
         "🔁 /loop — Toggle loop\n"
-        "🔊 /vol `<0\\-200>` — Set volume\n"
+        "🔊 /vol `<0\\-200>` — Volume\n"
         "🎵 /np — Now playing\n"
-        "🪵 /logs — Show recent logs \\(admin\\)\n\n"
+        "🪵 /logs — Logs \\(admin\\)\n\n"
         "Let's make music magic, nya\\~\\! ✨"
     )
     await update.message.reply_video(
@@ -447,23 +454,21 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not track:
         await msg.edit_text(
-            "Gomen\\~ couldn't find that song 😢",
+            "Gomen\\~ couldn't find that song 😢\n"
+            "YouTube might be blocked\\. Try a different song name\\!",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
 
     queues[chat_id].append(track)
     await _cancel_auto_leave(chat_id)
-
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    await _safe_delete(msg)
 
     is_idle = currently_playing.get(chat_id) is None
 
     if is_idle:
-        loading_msg = await update.message.reply_text(
+        loading_msg = await context.bot.send_message(
+            chat_id,
             f"⏳ Loading *{_esc(track['title'])}*\\.\\.\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
@@ -471,13 +476,11 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         now = currently_playing.get(chat_id, track)
         dur = _fmt_duration(now.get("duration", 0))
 
-        try:
-            await loading_msg.delete()
-        except Exception:
-            pass
+        await _safe_delete(loading_msg)
 
         if started:
-            await update.message.reply_text(
+            await context.bot.send_message(
+                chat_id,
                 f"🎶 *Now Playing*\n\n"
                 f"🎵 *{_esc(now['title'])}*\n"
                 f"👤 {_esc(now.get('uploader', 'Unknown'))}\n"
@@ -486,18 +489,20 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=player_keyboard(chat_id),
             )
         else:
-            await update.message.reply_text(
-                "Gomen\\~ something went wrong starting playback 😢\n\n"
-                "Make sure:\n"
+            await context.bot.send_message(
+                chat_id,
+                "Gomen\\~ playback failed 😢\n\n"
+                "Check:\n"
                 "• Voice chat is started in group\n"
-                "• Assistant account is added to group\n"
-                "• Bot has proper permissions",
+                "• Assistant account is in group\n"
+                "• Bot has permissions",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
     else:
         pos = len(queues[chat_id])
         dur = _fmt_duration(track.get("duration", 0))
-        await update.message.reply_text(
+        await context.bot.send_message(
+            chat_id,
             f"✅ *Added to Queue \\#{pos}*\n\n"
             f"🎵 *{_esc(track['title'])}*\n"
             f"👤 {_esc(track.get('uploader', 'Unknown'))}\n"
@@ -545,7 +550,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     text = "🎵 *Top Results* — pick a song Senpai\\~\n\n"
     for i, r in enumerate(results):
         text += (
-            f"`{i + 1}\\.` *{_esc(r['title'])}*\n"
+            f"`{i + 1}.` *{_esc(r['title'])}*\n"
             f"   👤 {_esc(r.get('uploader', '?'))}  "
             f"⏱ {_esc(_fmt_duration(r['duration']))}\n\n"
         )
@@ -583,57 +588,37 @@ async def np_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await call.pause_stream(update.effective_chat.id)
-        await update.message.reply_text(
-            "Music paused ⏸️",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Music paused ⏸️")
     except Exception:
-        await update.message.reply_text(
-            "Nothing is playing right now Senpai\\! 🤔",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Nothing is playing right now! 🤔")
 
 
 async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await call.resume_stream(update.effective_chat.id)
-        await update.message.reply_text(
-            "Music resumed\\! ▶️🎶",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Music resumed! ▶️🎶")
     except Exception:
-        await update.message.reply_text(
-            "Nothing is paused right now Senpai\\! 🤔",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Nothing is paused right now! 🤔")
 
 
 async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "Only admins can skip, gomen\\~ 🙏",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Only admins can skip~ 🙏")
         return
 
     chat_id = update.effective_chat.id
     if not currently_playing.get(chat_id):
-        await update.message.reply_text(
-            "Nothing to skip nya\\~ 🌸",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Nothing to skip nya~ 🌸")
         return
 
-    await update.message.reply_text(
-        "⏭️ Skipping\\.\\.\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+    await update.message.reply_text("⏭️ Skipping...")
 
     if queues[chat_id]:
         started = await play_next(chat_id, change_stream=True)
         now = currently_playing.get(chat_id)
         if started and now:
-            await update.message.reply_text(
+            await context.bot.send_message(
+                chat_id,
                 f"🎵 *Now Playing*\n\n*{_esc(now['title'])}*",
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=player_keyboard(chat_id),
@@ -645,18 +630,12 @@ async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await call.leave_call(chat_id)
         except Exception:
             pass
-        await update.message.reply_text(
-            "Queue empty\\~ 🌸 Add more with /play\\!",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await context.bot.send_message(chat_id, "Queue empty~ 🌸 Add more with /play!")
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "Only admins can stop the music, gomen\\~ 🙏",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Only admins can stop~ 🙏")
         return
 
     chat_id = update.effective_chat.id
@@ -669,10 +648,7 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await call.leave_call(chat_id)
     except Exception:
         pass
-    await update.message.reply_text(
-        "Music stopped\\! Bye bye\\~ 👋",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+    await update.message.reply_text("Music stopped! Bye bye~ 👋")
 
 
 async def queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -681,121 +657,79 @@ async def queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = queues[chat_id]
 
     if not now and not q:
-        await update.message.reply_text(
-            "Queue is empty\\~ 🌸 Use /play to add songs\\!",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Queue is empty~ 🌸 Use /play to add songs!")
         return
 
     total_secs = sum(t.get("duration", 0) for t in q)
-    text = "🎵 *Music Queue*\n\n"
+    text = "🎵 Music Queue\n\n"
     if now:
-        text += (
-            f"▶️ *Now:* {_esc(now['title'])} "
-            f"`[{_fmt_duration(now.get('duration', 0))}]`\n\n"
-        )
+        text += f"▶️ Now: {now['title']} [{_fmt_duration(now.get('duration', 0))}]\n\n"
     if q:
-        text += "📋 *Up Next:*\n"
+        text += "📋 Up Next:\n"
         for i, track in enumerate(q[:10], 1):
-            text += (
-                f"`{i}.` {_esc(track['title'])} "
-                f"`[{_fmt_duration(track.get('duration', 0))}]`\n"
-            )
+            text += f"{i}. {track['title']} [{_fmt_duration(track.get('duration', 0))}]\n"
         if len(q) > 10:
-            text += f"\n\\.\\.\\.and *{len(q) - 10}* more tracks\\."
-        text += f"\n\n⏳ Total: `{_fmt_duration(total_secs)}`"
+            text += f"\n...and {len(q) - 10} more tracks."
+        text += f"\n\n⏳ Total: {_fmt_duration(total_secs)}"
     if loop_mode[chat_id]:
-        text += "\n🔁 *Loop ON*"
+        text += "\n🔁 Loop ON"
 
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+    await update.message.reply_text(text)
 
 
 async def loop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     loop_mode[chat_id] = not loop_mode[chat_id]
     state = "ON 🔁" if loop_mode[chat_id] else "OFF ▶️"
-    await update.message.reply_text(
-        f"Loop mode is now *{_esc(state)}*\\!",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+    await update.message.reply_text(f"Loop mode is now {state}!")
 
 
 async def vol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "Only admins can change volume, gomen\\~ 🙏",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Only admins can change volume~ 🙏")
         return
 
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text(
-            "Usage: `/vol <0\\-200>`",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Usage: /vol <0-200>")
         return
 
     volume = max(0, min(200, int(context.args[0])))
     chat_id = update.effective_chat.id
     try:
         await call.change_volume_call(chat_id, volume)
-        await update.message.reply_text(
-            f"🔊 Volume set to *{volume}%*\\!",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text(f"🔊 Volume set to {volume}%!")
     except Exception as exc:
         log.error("vol error: %s", exc)
-        await update.message.reply_text(
-            "Couldn't change volume right now\\~ 😢",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Couldn't change volume~ 😢")
 
 
 async def shuffle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     q = queues[chat_id]
     if not q:
-        await update.message.reply_text(
-            "Queue is empty\\~ 🌸",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Queue is empty~ 🌸")
         return
     random.shuffle(q)
-    await update.message.reply_text(
-        f"🔀 Queue shuffled\\! *{len(q)}* tracks randomised\\~ ✨",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+    await update.message.reply_text(f"🔀 Queue shuffled! {len(q)} tracks randomised~ ✨")
 
 
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text(
-            "Usage: `/remove <position>` \\(use /queue to see positions\\)",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Usage: /remove <position> (use /queue to see positions)")
         return
 
     pos = int(context.args[0])
     q = queues[chat_id]
     if not q:
-        await update.message.reply_text(
-            "Queue is empty nya\\~ 🌸",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Queue is empty~ 🌸")
         return
     if pos < 1 or pos > len(q):
-        await update.message.reply_text(
-            f"Invalid position\\! Queue has *{len(q)}* tracks\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text(f"Invalid position! Queue has {len(q)} tracks.")
         return
 
     removed = q.pop(pos - 1)
-    await update.message.reply_text(
-        f"🗑 Removed *{_esc(removed['title'])}* from position {pos}\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+    await update.message.reply_text(f"🗑 Removed '{removed['title']}' from position {pos}.")
 
 
 async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -812,69 +746,44 @@ async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         now = currently_playing.get(chat_id)
         if not now:
-            await update.message.reply_text(
-                "Nothing is playing\\! Use `/lyrics Artist \\- Title`",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+            await update.message.reply_text("Nothing playing! Use: /lyrics Artist - Title")
             return
         artist = now.get("uploader", "Unknown")
         title = now.get("title", "Unknown")
 
-    msg = await update.message.reply_text(
-        f"📝 Fetching lyrics for *{_esc(title)}*\\.\\.\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+    msg = await update.message.reply_text(f"📝 Fetching lyrics for '{title}'...")
     lyrics = await fetch_lyrics(artist.strip(), title.strip())
 
     if not lyrics:
-        await msg.edit_text(
-            f"Couldn't find lyrics for *{_esc(title)}* 😢\n\n"
-            f"Try: `/lyrics Artist \\- Song Title`",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await msg.edit_text(f"Couldn't find lyrics for '{title}' 😢\nTry: /lyrics Artist - Song Title")
         return
 
     snippet = lyrics[:3500]
     if len(lyrics) > 3500:
         snippet += "\n\n[... truncated]"
 
-    await msg.edit_text(
-        f"📝 *{_esc(title)}*\n\n{_esc(snippet)}",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+    await msg.edit_text(f"📝 {title}\n\n{snippet}")
 
 
 async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /logs — show the last 50 log lines (admin only).
-    Splits into multiple messages if needed.
-    """
     if not _is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "Only admins can view logs, gomen\\~ 🙏",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("Only admins can view logs~ 🙏")
         return
 
     lines = list(_log_buffer_handler.buffer)
     if not lines:
-        await update.message.reply_text(
-            "No logs yet nya\\~ 🌸",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await update.message.reply_text("No logs yet~ 🌸")
         return
 
-    # Send as plain text (no parse mode) to avoid escaping issues
     full_text = "\n".join(lines)
     chunk_size = 4000
     chunks = [full_text[i:i + chunk_size] for i in range(0, len(full_text), chunk_size)]
 
     for chunk in chunks:
-        # Use plain text to avoid backtick/markdown issues in logs
         await update.message.reply_text(f"📋 Recent Logs:\n\n{chunk}")
 
 
-# ─── CALLBACK QUERY HANDLER ──────────────────────────────────────────────────
+# ─── CALLBACK HANDLER ────────────────────────────────────────────────────────
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -894,28 +803,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         results = cache.get(msg_id)
 
         if not results or idx >= len(results):
-            await query.edit_message_text(
-                "Oops, result expired\\~ search again\\!",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+            await query.edit_message_text("Result expired~ search again!")
             return
 
         track = results[idx]
         cache.pop(msg_id, None)
         queues[chat_id].append(track)
         await _cancel_auto_leave(chat_id)
-
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
+        await _safe_delete(query.message)
 
         is_idle = currently_playing.get(chat_id) is None
         if is_idle:
             await context.bot.send_message(
                 chat_id,
-                f"⏳ Loading *{_esc(track['title'])}*\\.\\.\\.",
-                parse_mode=ParseMode.MARKDOWN_V2,
+                f"⏳ Loading '{track['title']}'...",
             )
             started = await play_next(chat_id)
             now = currently_playing.get(chat_id, track)
@@ -929,44 +830,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             else:
                 await context.bot.send_message(
                     chat_id,
-                    "Gomen\\~ playback failed 😢\n"
-                    "Check voice chat is active and assistant is in group\\!",
-                    parse_mode=ParseMode.MARKDOWN_V2,
+                    "Playback failed 😢 Check VC is active!",
                 )
         else:
             pos = len(queues[chat_id])
             await context.bot.send_message(
                 chat_id,
-                f"✅ Added *{_esc(track['title'])}* to queue at \\#{pos}\\.",
-                parse_mode=ParseMode.MARKDOWN_V2,
+                f"✅ Added '{track['title']}' to queue at #{pos}.",
             )
         return
 
     if data == "cancel_search":
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
+        await _safe_delete(query.message)
         return
 
     if data == "pause":
         try:
             await call.pause_stream(chat_id)
-            await query.answer("Paused ⏸️", show_alert=False)
         except Exception:
-            await query.answer("Nothing playing!", show_alert=False)
+            pass
 
     elif data == "resume":
         try:
             await call.resume_stream(chat_id)
-            await query.answer("Resumed ▶️", show_alert=False)
         except Exception:
-            await query.answer("Nothing paused!", show_alert=False)
+            pass
 
     elif data == "loop":
         loop_mode[chat_id] = not loop_mode[chat_id]
-        state = "ON" if loop_mode[chat_id] else "OFF"
-        await query.answer(f"Loop {state}", show_alert=False)
         try:
             await query.edit_message_reply_markup(player_keyboard(chat_id))
         except Exception:
@@ -982,7 +873,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     elif data == "skip":
         if not currently_playing.get(chat_id):
-            await query.answer("Nothing to skip!", show_alert=False)
             return
         if queues[chat_id]:
             started = await play_next(chat_id, change_stream=True)
@@ -1001,11 +891,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await call.leave_call(chat_id)
             except Exception:
                 pass
-            await context.bot.send_message(
-                chat_id,
-                "Queue empty\\~ 🌸 Add more with /play\\!",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+            await context.bot.send_message(chat_id, "Queue empty~ 🌸 /play to add more!")
 
     elif data == "stop":
         queues[chat_id].clear()
@@ -1017,10 +903,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await call.leave_call(chat_id)
         except Exception:
             pass
-        await query.edit_message_text(
-            "Music stopped\\! Hope you enjoyed it Senpai 💖",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        await query.edit_message_text("Music stopped! Hope you enjoyed it 💖")
 
     elif data == "queue":
         now = currently_playing.get(chat_id)
@@ -1042,14 +925,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 @call.on_update(StreamEnded)
 async def on_stream_end(client, update) -> None:
-    """Handle stream end — supports multiple pytgcalls versions."""
-    # Extract chat_id from various possible formats
     if isinstance(update, int):
         chat_id = update
     else:
         chat_id = getattr(update, "chat_id", None)
         if chat_id is None:
-            # Some pytgcalls versions nest it in .chat
             chat_obj = getattr(update, "chat", None)
             if isinstance(chat_obj, dict):
                 chat_id = chat_obj.get("id")
@@ -1057,16 +937,15 @@ async def on_stream_end(client, update) -> None:
                 chat_id = getattr(chat_obj, "id", None)
 
     if not isinstance(chat_id, int):
-        log.warning("on_stream_end: could not extract chat_id from: %r", update)
+        log.warning("on_stream_end: no chat_id from: %r", update)
         return
 
-    log.info("Stream ended in chat %d", chat_id)
+    log.info("Stream ended in %d", chat_id)
     currently_playing.pop(chat_id, None)
 
     if queues[chat_id]:
         started = await play_next(chat_id, change_stream=True)
         if not started:
-            log.warning("Auto-play next failed in %d", chat_id)
             _joined_chats.discard(chat_id)
     else:
         _joined_chats.discard(chat_id)
@@ -1082,13 +961,18 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ─── STARTUP / SHUTDOWN ──────────────────────────────────────────────────────
 
 async def post_init(application: Application) -> None:
+    # Clear any stuck webhook/pending updates
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    log.info("Cleared webhook + pending updates")
+
     log.info("Starting Pyrogram assistant...")
     await assistant.start()
     me = await assistant.get_me()
-    log.info("Assistant logged in as: %s (ID: %d)", me.first_name, me.id)
+    log.info("Assistant: %s (ID: %d)", me.first_name, me.id)
+
     log.info("Starting PyTgCalls...")
     await call.start()
-    log.info("🎀 Kawaii Music Bot v3.4 is live~ nyaa!")
+    log.info("🎀 Kawaii Music Bot v3.5 is live~!")
 
 
 async def post_shutdown(application: Application) -> None:
@@ -1140,8 +1024,12 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     log.info("Starting polling...")
-    app.run_polling(stop_signals=None)
+    app.run_polling(
+        drop_pending_updates=True,  # ← Fixes 409 conflict on restart
+        stop_signals=None,
+    )
 
 
 if __name__ == "__main__":
     main()
+  
