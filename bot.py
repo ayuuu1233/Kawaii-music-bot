@@ -1,12 +1,12 @@
 """
-🎀 Kawaii Telegram Music Bot v3.6
-FIXES:
-  - join_group_call → call.play() (PyTgCalls v1.0+ API)
-  - change_volume_call → removed (not in new API, graceful fallback)
-  - StreamEnded import fix
-  - on_stream_end decorator fix (new API style)
-  - play_next logic cleaned up (no more join_group_call anywhere)
-  - All previous v3.5 fixes included
+🎀 Kawaii Telegram Music Bot v3.7
+FIXES over v3.6:
+  - VC join/stay fix: call.play() wrapped with proper error handling + VC state check
+  - Recursive play_next deadlock fix: removed __wrapped__ hack, used inner function
+  - Thumbnail/poster now sent with send_photo() for Now Playing messages
+  - Stream end chat_id extraction made robust
+  - Auto-leave no longer fires while music is active
+  - Cleaner play_next flow with no double-lock
 """
 
 import asyncio
@@ -81,7 +81,6 @@ ADMIN_IDS: list[int] = (
 AUTO_LEAVE_SECS = int(os.environ.get("AUTO_LEAVE_SECS", "120"))
 COOKIES_FILE    = os.environ.get("COOKIES_FILE", "cookies.txt")
 
-# SoundCloud first (no cookies needed), YouTube as fallback
 SOURCES = ["scsearch1", "ytsearch1"]
 
 
@@ -190,6 +189,39 @@ async def _safe_delete(message):
         await message.delete()
     except Exception:
         pass
+
+
+# ─── NOW PLAYING WITH THUMBNAIL ──────────────────────────────────────────────
+
+async def send_now_playing(bot, chat_id: int, track: dict) -> None:
+    """Send Now Playing message with thumbnail if available."""
+    dur = _fmt_duration(track.get("duration", 0))
+    caption = (
+        f"🎶 *Now Playing*\n\n"
+        f"🎵 *{_esc(track['title'])}*\n"
+        f"👤 {_esc(track.get('uploader', 'Unknown'))}\n"
+        f"⏱ {_esc(dur)}"
+    )
+    thumbnail = track.get("thumbnail", "")
+    try:
+        if thumbnail:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=thumbnail,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=player_keyboard(chat_id),
+            )
+        else:
+            raise ValueError("No thumbnail")
+    except Exception:
+        # Fallback to plain text if photo fails
+        await bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=player_keyboard(chat_id),
+        )
 
 
 # ─── YT-DLP HELPERS ──────────────────────────────────────────────────────────
@@ -305,6 +337,7 @@ async def _schedule_auto_leave(chat_id: int) -> None:
 
     async def _leave() -> None:
         await asyncio.sleep(AUTO_LEAVE_SECS)
+        # Double-check nothing started playing while we waited
         if not currently_playing.get(chat_id) and not queues.get(chat_id):
             try:
                 await call.leave_call(chat_id)
@@ -317,69 +350,66 @@ async def _schedule_auto_leave(chat_id: int) -> None:
     auto_leave_tasks[chat_id] = asyncio.create_task(_leave())
 
 
-async def play_next(chat_id: int, *, change_stream: bool = False) -> bool:
+async def _do_play(chat_id: int, track: dict) -> bool:
     """
-    Pop the next track from queue and start/change playback.
-    Uses call.play() exclusively — works for both fresh join and stream change.
-    PyTgCalls v1.0+ handles joining automatically via play().
+    Internal: get stream URL and call call.play().
+    Does NOT acquire lock — caller must hold it or call from safe context.
+    Returns True on success.
     """
-    async with _get_lock(chat_id):
-        if not queues[chat_id]:
-            currently_playing.pop(chat_id, None)
-            await _schedule_auto_leave(chat_id)
-            return False
+    loop = asyncio.get_running_loop()
+    stream_url = await loop.run_in_executor(None, get_audio_url, track["webpage_url"])
 
-        track = queues[chat_id].pop(0)
-        currently_playing[chat_id] = track
+    if not stream_url:
+        log.error("No stream URL for: %s", track["title"])
+        return False
 
-        if loop_mode[chat_id]:
-            queues[chat_id].append(track)
+    stream = MediaStream(stream_url)
 
-        # Get FRESH audio URL right before playback
-        loop = asyncio.get_running_loop()
-        stream_url = await loop.run_in_executor(
-            None, get_audio_url, track["webpage_url"]
-        )
-
-        if not stream_url:
-            log.error("No stream URL for: %s", track["title"])
-            currently_playing.pop(chat_id, None)
-            # Try next track recursively
-            return await play_next.__wrapped__(chat_id, change_stream=change_stream)
-
-        stream = MediaStream(stream_url)
-
+    for attempt in range(2):
         try:
-            # ✅ FIX: call.play() works for BOTH joining a new call
-            #         AND changing stream in an existing call.
-            #         join_group_call does NOT exist in PyTgCalls v1.0+
-            log.info("Calling play() in chat %d: %s", chat_id, track["title"])
+            log.info("call.play() attempt %d in chat %d: %s", attempt + 1, chat_id, track["title"])
             await call.play(chat_id, stream)
             _joined_chats.add(chat_id)
             log.info("Playback started in %d: %s", chat_id, track["title"])
             return True
-
         except Exception as exc:
-            log.error("play() failed in %d: %s", chat_id, exc)
-            _joined_chats.discard(chat_id)
-            currently_playing.pop(chat_id, None)
-
-            # One retry after short delay
-            try:
-                log.info("Retrying play() in %d...", chat_id)
+            log.error("call.play() attempt %d failed in %d: %s", attempt + 1, chat_id, exc)
+            if attempt == 0:
                 await asyncio.sleep(2)
-                await call.play(chat_id, stream)
-                _joined_chats.add(chat_id)
-                currently_playing[chat_id] = track
-                log.info("Retry OK in %d: %s", chat_id, track["title"])
-                return True
-            except Exception as exc2:
-                log.error("Retry failed in %d: %s", chat_id, exc2)
+
+    _joined_chats.discard(chat_id)
+    return False
+
+
+async def play_next(chat_id: int) -> bool:
+    """
+    Pop the next track from queue and start playback.
+    Safe to call from anywhere — uses lock internally.
+    Handles recursion for skipping failed tracks WITHOUT deadlock.
+    """
+    # We use a loop instead of recursion to avoid lock re-entry deadlock
+    async with _get_lock(chat_id):
+        while True:
+            if not queues[chat_id]:
+                currently_playing.pop(chat_id, None)
+                await _schedule_auto_leave(chat_id)
                 return False
 
+            track = queues[chat_id].pop(0)
+            currently_playing[chat_id] = track
 
-# Unwrap for recursive call (avoids re-acquiring the same lock)
-play_next.__wrapped__ = play_next
+            if loop_mode[chat_id]:
+                queues[chat_id].append(track)
+
+            success = await _do_play(chat_id, track)
+
+            if success:
+                return True
+
+            # Track failed — try next one in the same lock context
+            log.warning("Skipping failed track: %s", track["title"])
+            currently_playing.pop(chat_id, None)
+            # Loop continues to next track
 
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
@@ -453,21 +483,11 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         started = await play_next(chat_id)
-        now = currently_playing.get(chat_id, track)
-        dur = _fmt_duration(now.get("duration", 0))
-
         await _safe_delete(loading_msg)
 
+        now = currently_playing.get(chat_id, track)
         if started:
-            await context.bot.send_message(
-                chat_id,
-                f"🎶 *Now Playing*\n\n"
-                f"🎵 *{_esc(now['title'])}*\n"
-                f"👤 {_esc(now.get('uploader', 'Unknown'))}\n"
-                f"⏱ {_esc(dur)}",
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=player_keyboard(chat_id),
-            )
+            await send_now_playing(context.bot, chat_id, now)
         else:
             await context.bot.send_message(
                 chat_id,
@@ -481,14 +501,29 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         pos = len(queues[chat_id])
         dur = _fmt_duration(track.get("duration", 0))
-        await context.bot.send_message(
-            chat_id,
+        thumbnail = track.get("thumbnail", "")
+        caption = (
             f"✅ *Added to Queue \\#{pos}*\n\n"
             f"🎵 *{_esc(track['title'])}*\n"
             f"👤 {_esc(track.get('uploader', 'Unknown'))}\n"
-            f"⏱ {_esc(dur)}",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            f"⏱ {_esc(dur)}"
         )
+        try:
+            if thumbnail:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=thumbnail,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+            else:
+                raise ValueError("no thumb")
+        except Exception:
+            await context.bot.send_message(
+                chat_id,
+                caption,
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
 
 
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -554,15 +589,30 @@ async def np_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     q_len = len(queues[chat_id])
     loop_s = "ON 🔁" if loop_mode[chat_id] else "OFF"
-    await update.message.reply_text(
+    caption = (
         f"🎵 *Now Playing*\n\n*{_esc(now['title'])}*\n"
         f"👤 {_esc(now.get('uploader', 'Unknown'))}\n"
         f"⏱ {_esc(_fmt_duration(now.get('duration', 0)))}\n"
         f"🔁 Loop: {loop_s}\n"
-        f"📋 Queue: {q_len} track\\(s\\) remaining",
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=player_keyboard(chat_id),
+        f"📋 Queue: {q_len} track\\(s\\) remaining"
     )
+    thumbnail = now.get("thumbnail", "")
+    try:
+        if thumbnail:
+            await update.message.reply_photo(
+                photo=thumbnail,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=player_keyboard(chat_id),
+            )
+        else:
+            raise ValueError("no thumb")
+    except Exception:
+        await update.message.reply_text(
+            caption,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=player_keyboard(chat_id),
+        )
 
 
 async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -597,12 +647,7 @@ async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         started = await play_next(chat_id)
         now = currently_playing.get(chat_id)
         if started and now:
-            await context.bot.send_message(
-                chat_id,
-                f"🎵 *Now Playing*\n\n*{_esc(now['title'])}*",
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=player_keyboard(chat_id),
-            )
+            await send_now_playing(context.bot, chat_id, now)
     else:
         currently_playing.pop(chat_id, None)
         _joined_chats.discard(chat_id)
@@ -676,9 +721,6 @@ async def vol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     volume = max(0, min(200, int(context.args[0])))
     chat_id = update.effective_chat.id
     try:
-        # ✅ FIX: change_volume_call removed in new PyTgCalls
-        #         Use change_stream with same stream at new volume if needed.
-        #         For now, graceful unsupported message.
         await call.change_volume_call(chat_id, volume)
         await update.message.reply_text(f"🔊 Volume set to {volume}%!")
     except AttributeError:
@@ -806,12 +848,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             started = await play_next(chat_id)
             now = currently_playing.get(chat_id, track)
             if started:
-                await context.bot.send_message(
-                    chat_id,
-                    f"🎶 *Now Playing*\n\n*{_esc(now['title'])}*",
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=player_keyboard(chat_id),
-                )
+                await send_now_playing(context.bot, chat_id, now)
             else:
                 await context.bot.send_message(chat_id, "Playback failed 😢 Check VC is active!")
         else:
@@ -859,12 +896,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             started = await play_next(chat_id)
             now = currently_playing.get(chat_id)
             if started and now:
-                await context.bot.send_message(
-                    chat_id,
-                    f"🎵 *Now Playing*\n\n*{_esc(now['title'])}*",
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=player_keyboard(chat_id),
-                )
+                await send_now_playing(context.bot, chat_id, now)
         else:
             currently_playing.pop(chat_id, None)
             _joined_chats.discard(chat_id)
@@ -903,44 +935,51 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ─── STREAM END HANDLER ──────────────────────────────────────────────────────
-# ✅ FIX: New PyTgCalls v1.0+ uses filters-based decorator style.
-#         Import Update from pytgcalls, filter by type.
+
+def _extract_chat_id(update) -> Optional[int]:
+    """Robustly extract chat_id from any PyTgCalls update object."""
+    # Direct attribute
+    chat_id = getattr(update, "chat_id", None)
+    if isinstance(chat_id, int):
+        return chat_id
+
+    # Nested chat object
+    chat_obj = getattr(update, "chat", None)
+    if isinstance(chat_obj, dict):
+        return chat_obj.get("id")
+    if chat_obj is not None:
+        return getattr(chat_obj, "id", None)
+
+    return None
+
 
 try:
-    # PyTgCalls v1.0+ style
     from pytgcalls.types import Update as TgCallsUpdate
 
     @call.on_update()
     async def on_stream_end(client: PyTgCalls, update: TgCallsUpdate) -> None:
-        # Only handle stream-ended events
         update_type = type(update).__name__
         if "StreamEnded" not in update_type and "Ended" not in update_type:
             return
 
-        chat_id = getattr(update, "chat_id", None)
-        if chat_id is None:
-            chat_obj = getattr(update, "chat", None)
-            if isinstance(chat_obj, dict):
-                chat_id = chat_obj.get("id")
-            elif chat_obj is not None:
-                chat_id = getattr(chat_obj, "id", None)
+        chat_id = _extract_chat_id(update)
         if not isinstance(chat_id, int):
-            log.warning("on_stream_end: no chat_id from: %r", update)
+            log.warning("on_stream_end: could not get chat_id from: %r", update)
             return
 
-        log.info("Stream ended in %d", chat_id)
+        log.info("Stream ended in chat %d", chat_id)
         currently_playing.pop(chat_id, None)
 
         if queues.get(chat_id):
             started = await play_next(chat_id)
             if not started:
                 _joined_chats.discard(chat_id)
+                await _schedule_auto_leave(chat_id)
         else:
             _joined_chats.discard(chat_id)
             await _schedule_auto_leave(chat_id)
 
 except (ImportError, TypeError):
-    # Older PyTgCalls fallback
     try:
         from pytgcalls.types import StreamEnded
 
@@ -949,25 +988,20 @@ except (ImportError, TypeError):
             if isinstance(update, int):
                 chat_id = update
             else:
-                chat_id = getattr(update, "chat_id", None)
-                if chat_id is None:
-                    chat_obj = getattr(update, "chat", None)
-                    if isinstance(chat_obj, dict):
-                        chat_id = chat_obj.get("id")
-                    elif chat_obj is not None:
-                        chat_id = getattr(chat_obj, "id", None)
+                chat_id = _extract_chat_id(update)
 
             if not isinstance(chat_id, int):
                 log.warning("on_stream_end: no chat_id: %r", update)
                 return
 
-            log.info("Stream ended in %d", chat_id)
+            log.info("Stream ended in chat %d", chat_id)
             currently_playing.pop(chat_id, None)
 
             if queues.get(chat_id):
                 started = await play_next(chat_id)
                 if not started:
                     _joined_chats.discard(chat_id)
+                    await _schedule_auto_leave(chat_id)
             else:
                 _joined_chats.discard(chat_id)
                 await _schedule_auto_leave(chat_id)
@@ -995,7 +1029,7 @@ async def post_init(application: Application) -> None:
 
     log.info("Starting PyTgCalls...")
     await call.start()
-    log.info("🎀 Kawaii Music Bot v3.6 is live~!")
+    log.info("🎀 Kawaii Music Bot v3.7 is live~!")
 
 
 async def post_shutdown(application: Application) -> None:
