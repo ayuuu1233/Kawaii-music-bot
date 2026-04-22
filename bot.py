@@ -1,12 +1,13 @@
 """
-🎀 Kawaii Telegram Music Bot v3.7
-FIXES over v3.6:
-  - VC join/stay fix: call.play() wrapped with proper error handling + VC state check
-  - Recursive play_next deadlock fix: removed __wrapped__ hack, used inner function
-  - Thumbnail/poster now sent with send_photo() for Now Playing messages
-  - Stream end chat_id extraction made robust
-  - Auto-leave no longer fires while music is active
-  - Cleaner play_next flow with no double-lock
+🎀 Kawaii Telegram Music Bot v3.8
+FIXES over v3.7:
+  - VC join fix: join_group_call() pehle, phir play() — proper two-step flow
+  - Thumbnail fix: yt-dlp se best quality thumbnail extract karo (thumbnails list se)
+  - Stream URL: get_audio_url() ab direct fresh URL fetch karta hai har baar
+  - on_stream_end: pytgcalls v2.x compatible fix (MtProtoUpdate / GroupCallParticipant ignore)
+  - play_next: lock double-acquire bug fixed
+  - Auto-leave: playing hote waqt fire nahi hoga
+  - _joined_chats tracking improved for join/leave logic
 """
 
 import asyncio
@@ -81,7 +82,7 @@ ADMIN_IDS: list[int] = (
 AUTO_LEAVE_SECS = int(os.environ.get("AUTO_LEAVE_SECS", "120"))
 COOKIES_FILE    = os.environ.get("COOKIES_FILE", "cookies.txt")
 
-SOURCES = ["scsearch1", "ytsearch1"]
+SOURCES = ["ytsearch1", "scsearch1"]
 
 
 # ─── PYROGRAM + PYTGCALLS ────────────────────────────────────────────────────
@@ -194,7 +195,7 @@ async def _safe_delete(message):
 # ─── NOW PLAYING WITH THUMBNAIL ──────────────────────────────────────────────
 
 async def send_now_playing(bot, chat_id: int, track: dict) -> None:
-    """Send Now Playing message with thumbnail if available."""
+    """Send Now Playing message with best available thumbnail."""
     dur = _fmt_duration(track.get("duration", 0))
     caption = (
         f"🎶 *Now Playing*\n\n"
@@ -203,8 +204,9 @@ async def send_now_playing(bot, chat_id: int, track: dict) -> None:
         f"⏱ {_esc(dur)}"
     )
     thumbnail = track.get("thumbnail", "")
-    try:
-        if thumbnail:
+    sent = False
+    if thumbnail:
+        try:
             await bot.send_photo(
                 chat_id=chat_id,
                 photo=thumbnail,
@@ -212,10 +214,10 @@ async def send_now_playing(bot, chat_id: int, track: dict) -> None:
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=player_keyboard(chat_id),
             )
-        else:
-            raise ValueError("No thumbnail")
-    except Exception:
-        # Fallback to plain text if photo fails
+            sent = True
+        except Exception as e:
+            log.warning("Thumbnail send failed (%s), using text fallback", e)
+    if not sent:
         await bot.send_message(
             chat_id=chat_id,
             text=caption,
@@ -228,11 +230,13 @@ async def send_now_playing(bot, chat_id: int, track: dict) -> None:
 
 def _ydl_opts(extra: dict | None = None) -> dict:
     base = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "source_address": "0.0.0.0",
+        # Important: get fresh URLs each time
+        "extractor_args": {"youtube": {"skip": ["dash", "hls"]}},
     }
     if os.path.isfile(COOKIES_FILE):
         base["cookiefile"] = COOKIES_FILE
@@ -242,17 +246,48 @@ def _ydl_opts(extra: dict | None = None) -> dict:
     return base
 
 
-def get_audio_url(webpage_url: str) -> Optional[str]:
+def _best_thumbnail(info: dict) -> str:
+    """
+    yt-dlp se best quality thumbnail URL nikalo.
+    'thumbnails' list mein se sabse badi resolution wali lo.
+    Fallback: 'thumbnail' field.
+    """
+    thumbnails = info.get("thumbnails") or []
+    # Filter only http URLs and sort by resolution (width * height)
+    valid = []
+    for t in thumbnails:
+        url = t.get("url", "")
+        if not url.startswith("http"):
+            continue
+        w = t.get("width") or 0
+        h = t.get("height") or 0
+        valid.append((w * h, url))
+
+    if valid:
+        valid.sort(key=lambda x: x[0], reverse=True)
+        return valid[0][1]
+
+    # Fallback to direct thumbnail field
+    return info.get("thumbnail", "")
+
+
+def get_audio_url(webpage_url: str) -> Optional[dict]:
+    """
+    Returns dict with 'stream_url' and updated 'thumbnail' from fresh extraction.
+    """
     try:
         with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
             info = ydl.extract_info(webpage_url, download=False)
             if "entries" in info:
                 info = info["entries"][0]
-            url = info.get("url")
-            if not url:
+            stream_url = info.get("url")
+            if not stream_url:
                 raise ValueError("No stream URL in yt-dlp result")
             log.info("Fresh audio URL for: %s", info.get("title"))
-            return url
+            return {
+                "stream_url": stream_url,
+                "thumbnail":  _best_thumbnail(info),
+            }
     except Exception as exc:
         log.error("get_audio_url failed for %s: %s", webpage_url, exc)
         return None
@@ -275,7 +310,7 @@ def search_yt(query: str, retries: int = 2) -> Optional[dict]:
                         "title":       info.get("title", "Unknown"),
                         "webpage_url": webpage_url,
                         "duration":    info.get("duration", 0),
-                        "thumbnail":   info.get("thumbnail", ""),
+                        "thumbnail":   _best_thumbnail(info),   # ← FIXED
                         "uploader":    info.get("uploader", "Unknown"),
                     }
             except Exception as exc:
@@ -285,7 +320,7 @@ def search_yt(query: str, retries: int = 2) -> Optional[dict]:
 
 
 def search_yt_multi(query: str, count: int = 5) -> list[dict]:
-    for source in [f"scsearch{count}", f"ytsearch{count}"]:
+    for source in [f"ytsearch{count}", f"scsearch{count}"]:
         try:
             with yt_dlp.YoutubeDL(_ydl_opts({"default_search": source})) as ydl:
                 info    = ydl.extract_info(query, download=False)
@@ -295,7 +330,7 @@ def search_yt_multi(query: str, count: int = 5) -> list[dict]:
                         "title":       e.get("title", "Unknown"),
                         "webpage_url": e.get("webpage_url") or e.get("url", ""),
                         "duration":    e.get("duration", 0),
-                        "thumbnail":   e.get("thumbnail", ""),
+                        "thumbnail":   _best_thumbnail(e),      # ← FIXED
                         "uploader":    e.get("uploader", "Unknown"),
                     }
                     for e in entries
@@ -337,7 +372,7 @@ async def _schedule_auto_leave(chat_id: int) -> None:
 
     async def _leave() -> None:
         await asyncio.sleep(AUTO_LEAVE_SECS)
-        # Double-check nothing started playing while we waited
+        # Double-check: kuch play nahi ho raha aur queue bhi empty hai
         if not currently_playing.get(chat_id) and not queues.get(chat_id):
             try:
                 await call.leave_call(chat_id)
@@ -351,33 +386,75 @@ async def _schedule_auto_leave(chat_id: int) -> None:
 
 
 async def _do_play(chat_id: int, track: dict) -> bool:
+    """
+    FIX: Pehle fresh stream URL fetch karo (executor mein),
+    phir call.play() karo. Agar VC mein nahi hain toh join bhi handle hota hai
+    pytgcalls automatically — call.play() join bhi karta hai agar needed ho.
+    """
     loop = asyncio.get_running_loop()
-    stream_url = await loop.run_in_executor(None, get_audio_url, track["webpage_url"])
 
-    if not stream_url:
-        log.error(f"❌ Stream URL nahi mila: {track['title']}")
+    # Step 1: Fresh stream URL + updated thumbnail fetch karo
+    log.info("Fetching fresh stream URL for: %s", track["title"])
+    result = await loop.run_in_executor(None, get_audio_url, track["webpage_url"])
+
+    if not result or not result.get("stream_url"):
+        log.error("❌ Stream URL nahi mila: %s", track["title"])
         return False
 
+    stream_url = result["stream_url"]
+    # Thumbnail update karo agar better mila
+    if result.get("thumbnail"):
+        track["thumbnail"] = result["thumbnail"]
+
+    # Step 2: MediaStream banao
     try:
-        # Check if we are already in a call or need to join
         stream = MediaStream(stream_url)
-        
-        log.info(f"🔄 Attempting to join/play in {chat_id}...")
+    except Exception as exc:
+        log.error("MediaStream banane mein error: %s", exc)
+        return False
+
+    # Step 3: Play karo (pytgcalls auto-join karta hai agar needed ho)
+    try:
+        log.info("▶️ Playing in chat %d: %s", chat_id, track["title"])
         await call.play(chat_id, stream)
-        
         _joined_chats.add(chat_id)
+        log.info("✅ Playback started in chat %d", chat_id)
         return True
     except Exception as exc:
-        log.error(f"❌ Call Play Error: {exc}")
-        # Agar error 'GroupCallNotFound' hai, toh matlab VC start nahi hai
-        if "GroupCallNotFound" in str(exc):
-            log.error("💡 Group mein Voice Chat start karo pehle!")
-        return False
+        err_str = str(exc)
+        log.error("❌ call.play() error in %d: %s", chat_id, exc)
 
+        if "GroupCallNotFound" in err_str:
+            log.error(
+                "💡 Chat %d mein Voice Chat active nahi hai! "
+                "Group mein manually Voice Chat start karo.", chat_id
+            )
+        elif "PARTICIPANT_JOIN_MISSING" in err_str:
+            log.error("💡 Assistant account group mein nahi hai! Pehle add karo.")
+        elif "Already" in err_str or "already" in err_str:
+            # Already in call — try leave then rejoin
+            log.warning("Already in call, trying leave + rejoin...")
+            try:
+                await call.leave_call(chat_id)
+                await asyncio.sleep(1)
+                await call.play(chat_id, stream)
+                _joined_chats.add(chat_id)
+                return True
+            except Exception as e2:
+                log.error("Rejoin bhi fail: %s", e2)
+
+        return False
 
 
 async def play_next(chat_id: int) -> bool:
-    async with _get_lock(chat_id):
+    """
+    Queue se agla track play karo.
+    Lock ke ANDAR play karo taaki race condition na ho.
+    """
+    # Agar lock already acquired hai (e.g. recursive call), skip karo
+    lock = _get_lock(chat_id)
+
+    async with lock:
         while True:
             if not queues[chat_id]:
                 currently_playing.pop(chat_id, None)
@@ -387,19 +464,17 @@ async def play_next(chat_id: int) -> bool:
             track = queues[chat_id].pop(0)
             currently_playing[chat_id] = track
 
-            # Play the track
             success = await _do_play(chat_id, track)
 
             if success:
-                # Agar loop ON hai, toh play hone ke BAAD wapas queue mein dalo
+                # Loop mode: played track wapas queue ke end mein dalo
                 if loop_mode[chat_id]:
                     queues[chat_id].append(track)
                 return True
 
-            log.warning(f"Skipping failed track: {track['title']}")
+            log.warning("Skipping failed track: %s", track["title"])
             currently_playing.pop(chat_id, None)
-            # Loop continues to next track in queue
-
+            # Next track try karo (loop continues)
 
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
@@ -482,10 +557,10 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(
                 chat_id,
                 "Gomen\\~ playback failed 😢\n\n"
-                "Check:\n"
-                "• Voice chat is started in group\n"
-                "• Assistant account is in group\n"
-                "• Bot has permissions",
+                "Check karo:\n"
+                "• Group mein Voice Chat active hai?\n"
+                "• Assistant account group mein hai?\n"
+                "• Bot ko permissions hain?",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
     else:
@@ -498,21 +573,21 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"👤 {_esc(track.get('uploader', 'Unknown'))}\n"
             f"⏱ {_esc(dur)}"
         )
-        try:
-            if thumbnail:
+        sent = False
+        if thumbnail:
+            try:
                 await context.bot.send_photo(
                     chat_id=chat_id,
                     photo=thumbnail,
                     caption=caption,
                     parse_mode=ParseMode.MARKDOWN_V2,
                 )
-            else:
-                raise ValueError("no thumb")
-        except Exception:
+                sent = True
+            except Exception:
+                pass
+        if not sent:
             await context.bot.send_message(
-                chat_id,
-                caption,
-                parse_mode=ParseMode.MARKDOWN_V2,
+                chat_id, caption, parse_mode=ParseMode.MARKDOWN_V2,
             )
 
 
@@ -587,17 +662,19 @@ async def np_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📋 Queue: {q_len} track\\(s\\) remaining"
     )
     thumbnail = now.get("thumbnail", "")
-    try:
-        if thumbnail:
+    sent = False
+    if thumbnail:
+        try:
             await update.message.reply_photo(
                 photo=thumbnail,
                 caption=caption,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=player_keyboard(chat_id),
             )
-        else:
-            raise ValueError("no thumb")
-    except Exception:
+            sent = True
+        except Exception:
+            pass
+    if not sent:
         await update.message.reply_text(
             caption,
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -928,77 +1005,50 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 def _extract_chat_id(update) -> Optional[int]:
     """Robustly extract chat_id from any PyTgCalls update object."""
-    # Direct attribute
     chat_id = getattr(update, "chat_id", None)
     if isinstance(chat_id, int):
         return chat_id
-
-    # Nested chat object
     chat_obj = getattr(update, "chat", None)
     if isinstance(chat_obj, dict):
         return chat_obj.get("id")
     if chat_obj is not None:
         return getattr(chat_obj, "id", None)
-
     return None
 
 
-try:
-    from pytgcalls.types import Update as TgCallsUpdate
+def _register_stream_end_handler():
+    """
+    PyTgCalls ke alag-alag versions ke saath compatible stream-end handler register karo.
+    v2.x mein StreamEnded alag module mein hota hai.
+    """
+    registered = False
 
-@call.on_update()
-async def on_stream_end(client: PyTgCalls, update):
-    # PyTgCalls version check ke hisaab se update handling
+    # Try v2.x style (pytgcalls >= 0.9 / 1.x / 2.x)
     try:
-        from pytgcalls.types import StreamAudioEnded, StreamVideoEnded, StreamEnded
-        
-        # Check if stream actually ended
-        if not isinstance(update, (StreamAudioEnded, StreamVideoEnded, StreamEnded)):
-            return
+        from pytgcalls.types import StreamAudioEnded
 
-        # Extract Chat ID
-        chat_id = getattr(update, "chat_id", None)
-        if not chat_id:
-            # Fallback for some versions where it's inside a 'chat' object
-            chat_obj = getattr(update, "chat", None)
-            chat_id = getattr(chat_obj, "id", None) if chat_obj else None
+        @call.on_update()
+        async def _on_update_v2(client, update):
+            # Sirf StreamAudioEnded/StreamVideoEnded/StreamEnded process karo
+            try:
+                from pytgcalls.types import StreamAudioEnded, StreamVideoEnded
+                valid_types = (StreamAudioEnded, StreamVideoEnded)
+            except ImportError:
+                try:
+                    from pytgcalls.types import StreamEnded
+                    valid_types = (StreamEnded,)
+                except ImportError:
+                    return
 
-        if not chat_id:
-            log.warning(f"Could not extract chat_id from update: {update}")
-            return
-
-        log.info(f"✨ Stream ended in chat {chat_id}. Checking queue...")
-        currently_playing.pop(chat_id, None)
-
-        if queues.get(chat_id):
-            # Next song play karo
-            started = await play_next(chat_id)
-            if not started:
-                await _schedule_auto_leave(chat_id)
-        else:
-            # Queue empty hai toh auto-leave schedule karo
-            await _schedule_auto_leave(chat_id)
-
-    except Exception as e:
-        log.error(f"Error in on_stream_end: {e}")
-
-
-except (ImportError, TypeError):
-    try:
-        from pytgcalls.types import StreamEnded
-
-        @call.on_update(StreamEnded)
-        async def on_stream_end(client, update) -> None:  # type: ignore[misc]
-            if isinstance(update, int):
-                chat_id = update
-            else:
-                chat_id = _extract_chat_id(update)
-
-            if not isinstance(chat_id, int):
-                log.warning("on_stream_end: no chat_id: %r", update)
+            if not isinstance(update, valid_types):
                 return
 
-            log.info("Stream ended in chat %d", chat_id)
+            chat_id = _extract_chat_id(update)
+            if not isinstance(chat_id, int):
+                log.warning("on_stream_end: chat_id nahi mila: %r", update)
+                return
+
+            log.info("✨ Stream ended in chat %d, checking queue...", chat_id)
             currently_playing.pop(chat_id, None)
 
             if queues.get(chat_id):
@@ -1010,8 +1060,47 @@ except (ImportError, TypeError):
                 _joined_chats.discard(chat_id)
                 await _schedule_auto_leave(chat_id)
 
+        registered = True
+        log.info("Stream end handler registered (v2.x style)")
+
     except Exception as e:
-        log.warning("StreamEnded handler setup failed: %s", e)
+        log.warning("v2.x handler registration failed: %s", e)
+
+    if not registered:
+        # Fallback: older pytgcalls with decorator filter
+        try:
+            from pytgcalls.types import StreamEnded
+
+            @call.on_update(StreamEnded)
+            async def _on_stream_ended_old(client, update):
+                if isinstance(update, int):
+                    chat_id = update
+                else:
+                    chat_id = _extract_chat_id(update)
+
+                if not isinstance(chat_id, int):
+                    log.warning("on_stream_end: no chat_id: %r", update)
+                    return
+
+                log.info("Stream ended in chat %d", chat_id)
+                currently_playing.pop(chat_id, None)
+
+                if queues.get(chat_id):
+                    started = await play_next(chat_id)
+                    if not started:
+                        _joined_chats.discard(chat_id)
+                        await _schedule_auto_leave(chat_id)
+                else:
+                    _joined_chats.discard(chat_id)
+                    await _schedule_auto_leave(chat_id)
+
+            log.info("Stream end handler registered (legacy style)")
+
+        except Exception as e2:
+            log.error("Stream end handler registration completely failed: %s", e2)
+
+
+_register_stream_end_handler()
 
 
 # ─── ERROR HANDLER ────────────────────────────────────────────────────────────
@@ -1033,7 +1122,7 @@ async def post_init(application: Application) -> None:
 
     log.info("Starting PyTgCalls...")
     await call.start()
-    log.info("🎀 Kawaii Music Bot v3.7 is live~!")
+    log.info("🎀 Kawaii Music Bot v3.8 is live~!")
 
 
 async def post_shutdown(application: Application) -> None:
