@@ -351,43 +351,32 @@ async def _schedule_auto_leave(chat_id: int) -> None:
 
 
 async def _do_play(chat_id: int, track: dict) -> bool:
-    """
-    Internal: get stream URL and call call.play().
-    Does NOT acquire lock — caller must hold it or call from safe context.
-    Returns True on success.
-    """
     loop = asyncio.get_running_loop()
     stream_url = await loop.run_in_executor(None, get_audio_url, track["webpage_url"])
 
     if not stream_url:
-        log.error("No stream URL for: %s", track["title"])
+        log.error(f"❌ Stream URL nahi mila: {track['title']}")
         return False
 
-    stream = MediaStream(stream_url)
+    try:
+        # Check if we are already in a call or need to join
+        stream = MediaStream(stream_url)
+        
+        log.info(f"🔄 Attempting to join/play in {chat_id}...")
+        await call.play(chat_id, stream)
+        
+        _joined_chats.add(chat_id)
+        return True
+    except Exception as exc:
+        log.error(f"❌ Call Play Error: {exc}")
+        # Agar error 'GroupCallNotFound' hai, toh matlab VC start nahi hai
+        if "GroupCallNotFound" in str(exc):
+            log.error("💡 Group mein Voice Chat start karo pehle!")
+        return False
 
-    for attempt in range(2):
-        try:
-            log.info("call.play() attempt %d in chat %d: %s", attempt + 1, chat_id, track["title"])
-            await call.play(chat_id, stream)
-            _joined_chats.add(chat_id)
-            log.info("Playback started in %d: %s", chat_id, track["title"])
-            return True
-        except Exception as exc:
-            log.error("call.play() attempt %d failed in %d: %s", attempt + 1, chat_id, exc)
-            if attempt == 0:
-                await asyncio.sleep(2)
-
-    _joined_chats.discard(chat_id)
-    return False
 
 
 async def play_next(chat_id: int) -> bool:
-    """
-    Pop the next track from queue and start playback.
-    Safe to call from anywhere — uses lock internally.
-    Handles recursion for skipping failed tracks WITHOUT deadlock.
-    """
-    # We use a loop instead of recursion to avoid lock re-entry deadlock
     async with _get_lock(chat_id):
         while True:
             if not queues[chat_id]:
@@ -398,18 +387,19 @@ async def play_next(chat_id: int) -> bool:
             track = queues[chat_id].pop(0)
             currently_playing[chat_id] = track
 
-            if loop_mode[chat_id]:
-                queues[chat_id].append(track)
-
+            # Play the track
             success = await _do_play(chat_id, track)
 
             if success:
+                # Agar loop ON hai, toh play hone ke BAAD wapas queue mein dalo
+                if loop_mode[chat_id]:
+                    queues[chat_id].append(track)
                 return True
 
-            # Track failed — try next one in the same lock context
-            log.warning("Skipping failed track: %s", track["title"])
+            log.warning(f"Skipping failed track: {track['title']}")
             currently_playing.pop(chat_id, None)
-            # Loop continues to next track
+            # Loop continues to next track in queue
+
 
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
@@ -956,28 +946,41 @@ def _extract_chat_id(update) -> Optional[int]:
 try:
     from pytgcalls.types import Update as TgCallsUpdate
 
-    @call.on_update()
-    async def on_stream_end(client: PyTgCalls, update: TgCallsUpdate) -> None:
-        update_type = type(update).__name__
-        if "StreamEnded" not in update_type and "Ended" not in update_type:
+@call.on_update()
+async def on_stream_end(client: PyTgCalls, update):
+    # PyTgCalls version check ke hisaab se update handling
+    try:
+        from pytgcalls.types import StreamAudioEnded, StreamVideoEnded, StreamEnded
+        
+        # Check if stream actually ended
+        if not isinstance(update, (StreamAudioEnded, StreamVideoEnded, StreamEnded)):
             return
 
-        chat_id = _extract_chat_id(update)
-        if not isinstance(chat_id, int):
-            log.warning("on_stream_end: could not get chat_id from: %r", update)
+        # Extract Chat ID
+        chat_id = getattr(update, "chat_id", None)
+        if not chat_id:
+            # Fallback for some versions where it's inside a 'chat' object
+            chat_obj = getattr(update, "chat", None)
+            chat_id = getattr(chat_obj, "id", None) if chat_obj else None
+
+        if not chat_id:
+            log.warning(f"Could not extract chat_id from update: {update}")
             return
 
-        log.info("Stream ended in chat %d", chat_id)
+        log.info(f"✨ Stream ended in chat {chat_id}. Checking queue...")
         currently_playing.pop(chat_id, None)
 
         if queues.get(chat_id):
+            # Next song play karo
             started = await play_next(chat_id)
             if not started:
-                _joined_chats.discard(chat_id)
                 await _schedule_auto_leave(chat_id)
         else:
-            _joined_chats.discard(chat_id)
+            # Queue empty hai toh auto-leave schedule karo
             await _schedule_auto_leave(chat_id)
+
+    except Exception as e:
+        log.error(f"Error in on_stream_end: {e}")
 
 except (ImportError, TypeError):
     try:
