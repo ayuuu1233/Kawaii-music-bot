@@ -982,6 +982,7 @@ async def on_stream_end(client: PyTgCalls, update):
     except Exception as e:
         log.error(f"Error in on_stream_end: {e}")
 
+
 except (ImportError, TypeError):
     try:
         from pytgcalls.types import StreamEnded
