@@ -1,15 +1,19 @@
 """
-🎀 Kawaii Telegram Music Bot v3.9
-Compatible with: pytgcalls==2.1.0 (MarshalX / GroupCallFactory API)
+🎀 Kawaii Telegram Music Bot v4.0
+Exact compatibility:
+  - py-tgcalls==2.2.11
+  - pyrofork==2.3.69 (pyrogram fork)
+  - python-telegram-bot==21.6
 
-Key changes from v3.8:
-  - PyTgCalls / MediaStream / StreamEnded → GroupCallFactory / GroupCallFile / on_playout_ended
-  - Per-chat GroupCallFile instances in _group_calls dict
-  - Audio streamed via ffmpeg → raw PCM s16le file → GroupCallFile
-  - Stream end: on_playout_ended callback → queue advance
-  - VC join: group_call.start(chat_id) instead of call.play()
-  - play_on_repeat=False so playout_ended fires once per track
-  - Thumbnail: _best_thumbnail() from thumbnails list (highest res)
+Key APIs used:
+  - PyTgCalls(assistant)             ← main call client
+  - call.play(chat_id, MediaStream(url), GroupCallConfig(auto_start=True))
+  - call.pause(chat_id) / call.resume(chat_id)
+  - call.leave_call(chat_id)
+  - @call.on_update(filters.stream_end())  ← stream end handler
+  - StreamEnded.chat_id              ← get chat_id from update
+  - GroupCallConfig(auto_start=True) ← auto-create VC if not active
+  - MediaStream handles ffmpeg internally — direct URL works!
 """
 
 import asyncio
@@ -17,8 +21,6 @@ import collections
 import logging
 import os
 import random
-import subprocess
-import tempfile
 import threading
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -27,8 +29,9 @@ from typing import Optional
 import httpx
 import yt_dlp
 from pyrogram import Client as PyrogramClient
-from pytgcalls import GroupCallFactory
-from pytgcalls.implementation.group_call_file import GroupCallFile, GroupCallFileAction
+from pytgcalls import PyTgCalls, filters
+from pytgcalls.types import MediaStream, StreamEnded, GroupCallConfig
+from pytgcalls.types.stream import AudioQuality
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -82,30 +85,28 @@ AUTO_LEAVE_SECS = int(os.environ.get("AUTO_LEAVE_SECS", "120"))
 COOKIES_FILE    = os.environ.get("COOKIES_FILE", "cookies.txt")
 SOURCES         = ["ytsearch1", "scsearch1"]
 
-# Temp dir for PCM audio files
-AUDIO_TMP_DIR = tempfile.mkdtemp(prefix="kawaii_audio_")
 
-
-# ─── PYROGRAM CLIENT ─────────────────────────────────────────────────────────
+# ─── PYROGRAM + PY-TGCALLS ───────────────────────────────────────────────────
 
 assistant = PyrogramClient(
     "assistant",
     api_id=API_ID,
     api_hash=API_HASH,
     session_string=SESSION_STRING,
+    no_updates=False,
 )
+call = PyTgCalls(assistant)
 
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
 
-_group_calls:      dict[int, GroupCallFile]     = {}   # per-chat GroupCallFile
-queues:            dict[int, list[dict]]         = defaultdict(list)
-currently_playing: dict[int, Optional[dict]]     = {}
-loop_mode:         dict[int, bool]               = defaultdict(bool)
-_chat_locks:       dict[int, asyncio.Lock]       = {}
-auto_leave_tasks:  dict[int, asyncio.Task]       = {}
+queues:            dict[int, list[dict]]     = defaultdict(list)
+currently_playing: dict[int, Optional[dict]] = {}
+loop_mode:         dict[int, bool]           = defaultdict(bool)
+_chat_locks:       dict[int, asyncio.Lock]   = {}
+auto_leave_tasks:  dict[int, asyncio.Task]   = {}
 
-# Set in post_init so callbacks can access bot
+# Set in post_init so stream-end handler can send Now Playing
 _bot_app: Optional[Application] = None
 
 SEARCH_CACHE_KEY = "search_cache"
@@ -229,7 +230,7 @@ def _ydl_opts(extra: dict | None = None) -> dict:
 
 
 def _best_thumbnail(info: dict) -> str:
-    """Pick highest resolution thumbnail from yt-dlp info dict."""
+    """Highest resolution thumbnail from yt-dlp info."""
     thumbnails = info.get("thumbnails") or []
     valid = [
         (t.get("width", 0) * t.get("height", 0), t["url"])
@@ -305,110 +306,6 @@ def get_stream_url(webpage_url: str) -> tuple[str, str]:
         return "", ""
 
 
-def convert_to_pcm(stream_url: str, out_path: str) -> bool:
-    """
-    ffmpeg: streaming URL → raw PCM s16le 48000Hz stereo
-    pytgcalls GroupCallFile needs exactly this format.
-    """
-    cmd = [
-        "ffmpeg", "-y",
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "5",
-        "-i", stream_url,
-        "-f", "s16le",
-        "-ar", "48000",
-        "-ac", "2",
-        "-acodec", "pcm_s16le",
-        out_path,
-    ]
-    try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            stderr_tail = result.stderr[-800:].decode(errors="replace")
-            log.error("ffmpeg failed (code %d): %s", result.returncode, stderr_tail)
-            return False
-        size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
-        log.info("PCM ready: %s (%d KB)", out_path, size // 1024)
-        return size > 0
-    except subprocess.TimeoutExpired:
-        log.error("ffmpeg timed out")
-        return False
-    except FileNotFoundError:
-        log.error("ffmpeg not found! Run: apt install ffmpeg")
-        return False
-    except Exception as exc:
-        log.error("convert_to_pcm error: %s", exc)
-        return False
-
-
-# ─── GROUP CALL PER CHAT ─────────────────────────────────────────────────────
-
-def _make_group_call(chat_id: int) -> GroupCallFile:
-    """Create a new GroupCallFile for this chat and register playout_ended."""
-    gc = GroupCallFactory(assistant).get_file_group_call(
-        input_filename="",
-        play_on_repeat=False,  # CRITICAL: fires playout_ended when file ends
-    )
-
-    @gc.on_playout_ended
-    def _playout_ended(gc_inst, filename: str):
-        log.info("Playout ended in chat %d | file: %s", chat_id, filename)
-        # Schedule coroutine on the running event loop
-        try:
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(_on_track_finished(chat_id), loop)
-        except Exception as e:
-            log.error("playout_ended scheduling error: %s", e)
-
-    _group_calls[chat_id] = gc
-    log.info("GroupCallFile created for chat %d", chat_id)
-    return gc
-
-
-def _get_or_make_gc(chat_id: int) -> GroupCallFile:
-    if chat_id not in _group_calls:
-        return _make_group_call(chat_id)
-    return _group_calls[chat_id]
-
-
-async def _on_track_finished(chat_id: int) -> None:
-    """Advance queue after a track ends. Called from playout_ended callback."""
-    # Clean up temp PCM file
-    current = currently_playing.get(chat_id)
-    if current:
-        tmp = current.get("_tmp_file", "")
-        if tmp and os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
-        # Loop mode: re-add to queue
-        if loop_mode[chat_id]:
-            queues[chat_id].append({k: v for k, v in current.items() if k != "_tmp_file"})
-
-    currently_playing.pop(chat_id, None)
-
-    if queues.get(chat_id):
-        started = await _play_next_locked(chat_id)
-        if started and _bot_app:
-            now = currently_playing.get(chat_id)
-            if now:
-                try:
-                    await send_now_playing(_bot_app.bot, chat_id, now)
-                except Exception as e:
-                    log.error("send_now_playing error: %s", e)
-        if not started:
-            await _schedule_auto_leave(chat_id)
-    else:
-        await _schedule_auto_leave(chat_id)
-
-
 # ─── AUTO LEAVE ───────────────────────────────────────────────────────────────
 
 async def _cancel_auto_leave(chat_id: int) -> None:
@@ -424,73 +321,65 @@ async def _schedule_auto_leave(chat_id: int) -> None:
     async def _leave():
         await asyncio.sleep(AUTO_LEAVE_SECS)
         if not currently_playing.get(chat_id) and not queues.get(chat_id):
-            gc = _group_calls.get(chat_id)
-            if gc:
-                try:
-                    await gc.stop()
-                    log.info("Auto-left VC in chat %d", chat_id)
-                except Exception:
-                    pass
+            try:
+                await call.leave_call(chat_id)
+                log.info("Auto-left VC in chat %d", chat_id)
+            except Exception:
+                pass
 
     await _cancel_auto_leave(chat_id)
     auto_leave_tasks[chat_id] = asyncio.create_task(_leave())
 
 
-# ─── PLAYBACK CORE ────────────────────────────────────────────────────────────
+# ─── PLAYBACK ─────────────────────────────────────────────────────────────────
 
 async def _do_play(chat_id: int, track: dict) -> bool:
     """
-    Full play flow:
-    1. Get direct stream URL via yt-dlp
-    2. Convert to PCM via ffmpeg (blocking → run_in_executor)
-    3. Hand PCM file to GroupCallFile
+    Get fresh stream URL, then play via MediaStream.
+    MediaStream internally uses ffmpeg — no manual conversion needed.
+    GroupCallConfig(auto_start=True) auto-creates VC if not active.
     """
     loop = asyncio.get_running_loop()
 
-    # Step 1: Fresh stream URL
-    log.info("Getting stream URL for: %s", track["title"])
+    # Fresh stream URL + updated thumbnail
+    log.info("Getting stream URL: %s", track["title"])
     stream_url, thumb = await loop.run_in_executor(
         None, get_stream_url, track["webpage_url"]
     )
     if not stream_url:
-        log.error("No stream URL: %s", track["title"])
+        log.error("No stream URL for: %s", track["title"])
         return False
     if thumb:
         track["thumbnail"] = thumb
 
-    # Step 2: Convert to PCM
-    tmp_path = os.path.join(
-        AUDIO_TMP_DIR, f"chat{chat_id}_{random.randint(10000, 99999)}.raw"
-    )
-    log.info("Converting to PCM: %s", tmp_path)
-    ok = await loop.run_in_executor(None, convert_to_pcm, stream_url, tmp_path)
-    if not ok:
-        return False
-    track["_tmp_file"] = tmp_path
-
-    # Step 3: Play via GroupCallFile
-    gc = _get_or_make_gc(chat_id)
     try:
-        if gc.is_connected:
-            # Already in VC — swap the file
-            gc.input_filename = tmp_path
-            log.info("✅ Swapped track in VC (chat %d)", chat_id)
-        else:
-            # Join VC and start
-            gc.input_filename = tmp_path
-            await gc.start(chat_id)
-            log.info("✅ Joined VC and playing (chat %d)", chat_id)
+        stream = MediaStream(
+            stream_url,
+            audio_parameters=AudioQuality.HIGH,
+            video_flags=MediaStream.Flags.IGNORE,  # audio-only
+        )
+    except Exception as exc:
+        log.error("MediaStream creation failed: %s", exc)
+        return False
+
+    config = GroupCallConfig(auto_start=True)
+
+    try:
+        await call.play(chat_id, stream, config)
+        log.info("✅ Playing in chat %d: %s", chat_id, track["title"])
         return True
     except Exception as exc:
         err = str(exc)
-        log.error("❌ GroupCall error in chat %d: %s", chat_id, exc)
-        if "without a voice chat" in err or "GroupCallNotFound" in err:
-            log.error("💡 Voice Chat not active in group %d! Start it manually.", chat_id)
+        log.error("❌ call.play() error in chat %d: %s", chat_id, exc)
+        if "NoActiveGroupCall" in err:
+            log.error("💡 VC could not be auto-created in chat %d. Check admin perms.", chat_id)
+        elif "PARTICIPANT_JOIN_MISSING" in err or "not in the group" in err.lower():
+            log.error("💡 Assistant is not a member of chat %d. Add them first.", chat_id)
         return False
 
 
-async def _play_next_locked(chat_id: int) -> bool:
-    """Pop + play next track from queue. Acquires per-chat lock."""
+async def play_next(chat_id: int) -> bool:
+    """Pop + play next track. Acquires per-chat lock to prevent races."""
     async with _get_lock(chat_id):
         while True:
             if not queues[chat_id]:
@@ -502,10 +391,45 @@ async def _play_next_locked(chat_id: int) -> bool:
                 return True
             log.warning("Skipping failed track: %s", track["title"])
             currently_playing.pop(chat_id, None)
+            # Loop: try next track
 
 
-async def play_next(chat_id: int) -> bool:
-    return await _play_next_locked(chat_id)
+# ─── STREAM END HANDLER ──────────────────────────────────────────────────────
+
+@call.on_update(filters.stream_end())
+async def on_stream_end(client: PyTgCalls, update: StreamEnded) -> None:
+    """
+    Fires when current track ends naturally.
+    update.chat_id gives us the group.
+    update.stream_type is AUDIO or VIDEO.
+    """
+    # Only care about audio end
+    if update.stream_type != StreamEnded.Type.AUDIO:
+        return
+
+    chat_id: int = update.chat_id
+    log.info("🎵 Stream ended in chat %d", chat_id)
+
+    # Loop mode: re-add current track to queue before popping
+    current = currently_playing.get(chat_id)
+    if current and loop_mode[chat_id]:
+        queues[chat_id].append(current)
+
+    currently_playing.pop(chat_id, None)
+
+    if queues.get(chat_id):
+        started = await play_next(chat_id)
+        if started and _bot_app:
+            now = currently_playing.get(chat_id)
+            if now:
+                try:
+                    await send_now_playing(_bot_app.bot, chat_id, now)
+                except Exception as e:
+                    log.error("send_now_playing error: %s", e)
+        if not started:
+            await _schedule_auto_leave(chat_id)
+    else:
+        await _schedule_auto_leave(chat_id)
 
 
 # ─── LYRICS ───────────────────────────────────────────────────────────────────
@@ -599,9 +523,8 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id,
                 "Gomen\\~ playback failed 😢\n\n"
                 "Check karo:\n"
-                "• Group mein Voice Chat active hai?\n"
-                "• Assistant account group ka member hai?\n"
-                "• Server pe ffmpeg installed hai?",
+                "• Assistant account group mein add hai?\n"
+                "• Bot ko manage voice chat permission hai?",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
     else:
@@ -692,32 +615,34 @@ async def np_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await update.message.reply_photo(
                 photo=now["thumbnail"], caption=caption,
-                parse_mode=ParseMode.MARKDOWN_V2, reply_markup=player_keyboard(chat_id),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=player_keyboard(chat_id),
             )
             sent = True
         except Exception:
             pass
     if not sent:
-        await update.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=player_keyboard(chat_id))
+        await update.message.reply_text(
+            caption, parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=player_keyboard(chat_id),
+        )
 
 
 async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    gc = _group_calls.get(chat_id)
-    if gc and gc.is_connected:
-        gc.pause_playout()
+    try:
+        await call.pause(chat_id)
         await update.message.reply_text("Music paused ⏸️")
-    else:
+    except Exception:
         await update.message.reply_text("Nothing is playing right now! 🤔")
 
 
 async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    gc = _group_calls.get(chat_id)
-    if gc and gc.is_connected:
-        gc.resume_playout()
+    try:
+        await call.resume(chat_id)
         await update.message.reply_text("Music resumed! ▶️🎶")
-    else:
+    except Exception:
         await update.message.reply_text("Nothing is paused right now! 🤔")
 
 
@@ -732,9 +657,6 @@ async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text("⏭️ Skipping...")
-    gc = _group_calls.get(chat_id)
-    if gc:
-        gc.stop_playout()  # Stops current, triggers playout_ended
 
     if queues[chat_id]:
         started = await play_next(chat_id)
@@ -743,11 +665,10 @@ async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await send_now_playing(context.bot, chat_id, now)
     else:
         currently_playing.pop(chat_id, None)
-        if gc:
-            try:
-                await gc.stop()
-            except Exception:
-                pass
+        try:
+            await call.leave_call(chat_id)
+        except Exception:
+            pass
         await context.bot.send_message(chat_id, "Queue empty~ 🌸 Add more with /play!")
 
 
@@ -761,13 +682,10 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     currently_playing.pop(chat_id, None)
     loop_mode[chat_id] = False
     await _cancel_auto_leave(chat_id)
-
-    gc = _group_calls.pop(chat_id, None)
-    if gc:
-        try:
-            await gc.stop()
-        except Exception:
-            pass
+    try:
+        await call.leave_call(chat_id)
+    except Exception:
+        pass
     await update.message.reply_text("Music stopped! Bye bye~ 👋")
 
 
@@ -912,15 +830,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _safe_delete(query.message)
         return
 
-    gc = _group_calls.get(chat_id)
-
     if data == "pause":
-        if gc:
-            gc.pause_playout()
+        try:
+            await call.pause(chat_id)
+        except Exception:
+            pass
 
     elif data == "resume":
-        if gc:
-            gc.resume_playout()
+        try:
+            await call.resume(chat_id)
+        except Exception:
+            pass
 
     elif data == "loop":
         loop_mode[chat_id] = not loop_mode[chat_id]
@@ -938,8 +858,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data == "skip":
         if not currently_playing.get(chat_id):
             return
-        if gc:
-            gc.stop_playout()
         if queues[chat_id]:
             started = await play_next(chat_id)
             now = currently_playing.get(chat_id)
@@ -947,11 +865,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await send_now_playing(context.bot, chat_id, now)
         else:
             currently_playing.pop(chat_id, None)
-            if gc:
-                try:
-                    await gc.stop()
-                except Exception:
-                    pass
+            try:
+                await call.leave_call(chat_id)
+            except Exception:
+                pass
             await context.bot.send_message(chat_id, "Queue empty~ 🌸 /play to add more!")
 
     elif data == "stop":
@@ -959,12 +876,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         currently_playing.pop(chat_id, None)
         loop_mode[chat_id] = False
         await _cancel_auto_leave(chat_id)
-        gc = _group_calls.pop(chat_id, None)
-        if gc:
-            try:
-                await gc.stop()
-            except Exception:
-                pass
+        try:
+            await call.leave_call(chat_id)
+        except Exception:
+            pass
         await query.edit_message_text("Music stopped! Hope you enjoyed it 💖")
 
     elif data == "queue":
@@ -998,30 +913,25 @@ async def post_init(application: Application) -> None:
     await application.bot.delete_webhook(drop_pending_updates=True)
     log.info("Cleared webhook + pending updates")
 
-    log.info("Starting Pyrogram assistant...")
+    log.info("Starting Pyrogram (pyrofork) assistant...")
     await assistant.start()
     me = await assistant.get_me()
     log.info("Assistant: %s (ID: %d)", me.first_name, me.id)
 
-    log.info("🎀 Kawaii Music Bot v3.9 is live~!")
-    log.info("Backend: pytgcalls==2.1.0 (GroupCallFactory) + ffmpeg PCM")
+    log.info("Starting PyTgCalls...")
+    await call.start()
+    log.info("🎀 Kawaii Music Bot v4.0 is live~!")
+    log.info("Backend: py-tgcalls==2.2.11 + pyrofork + GroupCallConfig(auto_start=True)")
 
 
 async def post_shutdown(application: Application) -> None:
     log.info("Shutting down...")
     for task in auto_leave_tasks.values():
         task.cancel()
-    for gc in list(_group_calls.values()):
-        try:
-            await gc.stop()
-        except Exception:
-            pass
     try:
         await assistant.stop()
     except Exception:
         pass
-    import shutil
-    shutil.rmtree(AUDIO_TMP_DIR, ignore_errors=True)
     log.info("Bye bye~ 👋")
 
 
@@ -1067,3 +977,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
