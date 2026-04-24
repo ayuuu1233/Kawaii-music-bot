@@ -93,9 +93,12 @@ assistant = PyrogramClient(
     api_id=API_ID,
     api_hash=API_HASH,
     session_string=SESSION_STRING,
-    no_updates=False,
 )
 call = PyTgCalls(assistant)
+
+# Assistant ka InputPeer — post_init mein set hoga
+# join_as ke liye explicitly assistant account use karo
+_assistant_peer = None
 
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
@@ -108,6 +111,7 @@ auto_leave_tasks:  dict[int, asyncio.Task]   = {}
 
 # Set in post_init so stream-end handler can send Now Playing
 _bot_app: Optional[Application] = None
+_assistant_peer = None  # Assistant ka InputPeer for join_as
 
 SEARCH_CACHE_KEY = "search_cache"
 
@@ -333,15 +337,59 @@ async def _schedule_auto_leave(chat_id: int) -> None:
 
 # ─── PLAYBACK ─────────────────────────────────────────────────────────────────
 
+async def _ensure_assistant_in_group(chat_id: int) -> bool:
+    """
+    Agar assistant group mein nahi hai toh auto-join karo.
+    Returns True agar assistant group mein hai (ya join kar liya).
+    """
+    try:
+        # Check karo ki assistant group mein hai
+        await assistant.get_chat_member(chat_id, (await assistant.get_me()).id)
+        log.info("Assistant already in group %d", chat_id)
+        return True
+    except Exception:
+        pass
+
+    # Try joining via invite link or public username
+    try:
+        chat = await assistant.get_chat(chat_id)
+        username = getattr(chat, "username", None)
+        invite_link = getattr(chat, "invite_link", None)
+
+        if username:
+            await assistant.join_chat(username)
+            log.info("✅ Assistant joined group via username: %s", username)
+            return True
+        elif invite_link:
+            await assistant.join_chat(invite_link)
+            log.info("✅ Assistant joined group via invite link")
+            return True
+        else:
+            log.error(
+                "❌ Cannot auto-join chat %d — no username or invite link. "
+                "Please add assistant manually or make group public.", chat_id
+            )
+            return False
+    except Exception as exc:
+        log.error("❌ Auto-join failed for chat %d: %s", chat_id, exc)
+        return False
+
+
 async def _do_play(chat_id: int, track: dict) -> bool:
     """
-    Get fresh stream URL, then play via MediaStream.
-    MediaStream internally uses ffmpeg — no manual conversion needed.
+    1. Ensure assistant is in the group (auto-join if needed)
+    2. Get fresh stream URL via yt-dlp
+    3. Play via MediaStream (ffmpeg handled internally)
     GroupCallConfig(auto_start=True) auto-creates VC if not active.
     """
     loop = asyncio.get_running_loop()
 
-    # Fresh stream URL + updated thumbnail
+    # Step 1: Assistant group mein hona chahiye
+    in_group = await _ensure_assistant_in_group(chat_id)
+    if not in_group:
+        return False
+
+    # Step 2: Fresh stream URL + updated thumbnail
     log.info("Getting stream URL: %s", track["title"])
     stream_url, thumb = await loop.run_in_executor(
         None, get_stream_url, track["webpage_url"]
@@ -362,7 +410,10 @@ async def _do_play(chat_id: int, track: dict) -> bool:
         log.error("MediaStream creation failed: %s", exc)
         return False
 
-    config = GroupCallConfig(auto_start=True)
+    config = GroupCallConfig(
+        auto_start=True,
+        join_as=_assistant_peer,  # Assistant account join kare VC mein, bot nahi
+    )
 
     try:
         await call.play(chat_id, stream, config)
@@ -372,9 +423,9 @@ async def _do_play(chat_id: int, track: dict) -> bool:
         err = str(exc)
         log.error("❌ call.play() error in chat %d: %s", chat_id, exc)
         if "NoActiveGroupCall" in err:
-            log.error("💡 VC could not be auto-created in chat %d. Check admin perms.", chat_id)
+            log.error("💡 VC could not be auto-created in chat %d. Check bot admin perms.", chat_id)
         elif "PARTICIPANT_JOIN_MISSING" in err or "not in the group" in err.lower():
-            log.error("💡 Assistant is not a member of chat %d. Add them first.", chat_id)
+            log.error("💡 Assistant join failed for chat %d.", chat_id)
         return False
 
 
@@ -907,7 +958,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ─── STARTUP / SHUTDOWN ──────────────────────────────────────────────────────
 
 async def post_init(application: Application) -> None:
-    global _bot_app
+    global _bot_app, _assistant_peer
     _bot_app = application
 
     await application.bot.delete_webhook(drop_pending_updates=True)
@@ -918,10 +969,18 @@ async def post_init(application: Application) -> None:
     me = await assistant.get_me()
     log.info("Assistant: %s (ID: %d)", me.first_name, me.id)
 
+    # Assistant ka InputPeer fetch karo taaki VC mein assistant join kare, bot nahi
+    try:
+        _assistant_peer = await assistant.resolve_peer(me.id)
+        log.info("Assistant peer resolved for join_as: ID=%d", me.id)
+    except Exception as e:
+        log.warning("Could not resolve assistant peer: %s", e)
+        _assistant_peer = None
+
     log.info("Starting PyTgCalls...")
     await call.start()
     log.info("🎀 Kawaii Music Bot v4.0 is live~!")
-    log.info("Backend: py-tgcalls==2.2.11 + pyrofork + GroupCallConfig(auto_start=True)")
+    log.info("join_as = assistant account (not bot)"  )
 
 
 async def post_shutdown(application: Application) -> None:
@@ -977,4 +1036,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
+
