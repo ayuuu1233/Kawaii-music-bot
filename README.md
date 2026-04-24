@@ -2,7 +2,7 @@
 
 # 🎀 Kawaii Music Bot
 
-<img src="https://files.catbox.moe/9w0qsn.mp4" width="300"/>
+<img src="https://graph.org/file/9901c2070cea11d1aa194.jpg" width="300"/>
 
 > *Konnichiwa~ Your kawaii Telegram Voice Chat music bot!* 🌸
 
