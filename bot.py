@@ -340,39 +340,63 @@ async def _schedule_auto_leave(chat_id: int) -> None:
 async def _ensure_assistant_in_group(chat_id: int) -> bool:
     """
     Agar assistant group mein nahi hai toh auto-join karo.
-    Returns True agar assistant group mein hai (ya join kar liya).
+    Supergroup IDs (-100xxxxxxxxxx) ko properly handle karta hai.
+    Returns True agar assistant group mein hai (ya join ho gaya).
     """
-    try:
-        # Check karo ki assistant group mein hai
-        await assistant.get_chat_member(chat_id, (await assistant.get_me()).id)
-        log.info("Assistant already in group %d", chat_id)
-        return True
-    except Exception:
-        pass
+    me = await assistant.get_me()
 
-    # Try joining via invite link or public username
+    # Step 1: Already member hai? Check karo
     try:
-        chat = await assistant.get_chat(chat_id)
+        member = await assistant.get_chat_member(chat_id, me.id)
+        # Kicked/banned toh False return karo
+        if hasattr(member, "status"):
+            status = str(member.status)
+            if "kicked" in status.lower() or "banned" in status.lower():
+                log.error("❌ Assistant is banned/kicked from chat %d", chat_id)
+                return False
+        log.info("✅ Assistant already in group %d", chat_id)
+        return True
+    except Exception as e:
+        err = str(e)
+        # USER_NOT_PARTICIPANT = nahi hai, baaki errors = aur kuch
+        if "USER_NOT_PARTICIPANT" not in err and "user_not_participant" not in err.lower():
+            log.info("get_chat_member check: %s — trying to join anyway", err)
+
+    # Step 2: Chat info fetch karo — peer resolve karke
+    username = None
+    invite_link = None
+    try:
+        # Supergroup negative ID ko int mein convert karke try karo
+        try:
+            peer = await assistant.resolve_peer(chat_id)
+            chat = await assistant.get_chat(chat_id)
+        except Exception:
+            # Fallback: string ID try karo
+            chat = await assistant.get_chat(str(chat_id))
+
         username = getattr(chat, "username", None)
         invite_link = getattr(chat, "invite_link", None)
+    except Exception as e:
+        log.warning("Could not fetch chat info for %d: %s", chat_id, e)
 
-        if username:
-            await assistant.join_chat(username)
-            log.info("✅ Assistant joined group via username: %s", username)
+    # Step 3: Join karo
+    join_target = username or invite_link
+    if join_target:
+        try:
+            await assistant.join_chat(join_target)
+            log.info("✅ Assistant joined group %d via: %s", chat_id, join_target)
             return True
-        elif invite_link:
-            await assistant.join_chat(invite_link)
-            log.info("✅ Assistant joined group via invite link")
-            return True
-        else:
-            log.error(
-                "❌ Cannot auto-join chat %d — no username or invite link. "
-                "Please add assistant manually or make group public.", chat_id
-            )
+        except Exception as exc:
+            joined_err = str(exc)
+            if "already" in joined_err.lower() or "USER_ALREADY_PARTICIPANT" in joined_err:
+                log.info("✅ Assistant already in group %d (join confirmed)", chat_id)
+                return True
+            log.error("❌ Auto-join failed for chat %d: %s", chat_id, exc)
             return False
-    except Exception as exc:
-        log.error("❌ Auto-join failed for chat %d: %s", chat_id, exc)
-        return False
+
+    # Step 4: Username/link nahi mila — bot se invite link generate karne ki request
+    log.error("❌ Cannot auto-join chat %d — no username/invite link. Add assistant manually.", chat_id)
+    return False
 
 
 async def _do_play(chat_id: int, track: dict) -> bool:
@@ -1036,4 +1060,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
