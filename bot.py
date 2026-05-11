@@ -442,6 +442,14 @@ async def _do_play(chat_id: int, track: dict) -> bool:
     try:
         await call.play(chat_id, stream, config)
         log.info("✅ Playing in chat %d: %s", chat_id, track["title"])
+
+        # Unmute assistant in VC so audio is actually heard
+        try:
+            await call.unmute(chat_id)
+            log.info("🔊 Assistant unmuted in chat %d", chat_id)
+        except Exception as ue:
+            log.warning("Unmute attempt: %s (may not be needed)", ue)
+
         return True
     except Exception as exc:
         err = str(exc)
