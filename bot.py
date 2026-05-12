@@ -30,6 +30,7 @@ from typing import Optional
 
 import httpx
 import yt_dlp
+from bgm_extractor import register_bgm_handlers
 from pyrogram import Client as PyrogramClient
 from pytgcalls import PyTgCalls, filters
 from pytgcalls.types import GroupCallConfig, MediaStream, StreamEnded
@@ -1324,7 +1325,7 @@ def main() -> None:
 
     log.info("Polling started...")
     app.run_polling(drop_pending_updates=True, stop_signals=None)
-
+    register_bgm_handlers(app)
 
 if __name__ == "__main__":
     main()
